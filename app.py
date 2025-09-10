@@ -27,8 +27,8 @@ LOW_CONFIDENCE = 0.02
 # =========================
 # UI
 # =========================
-st.set_page_config(page_title="Chat with your PDFs", page_icon="🔎")
-st.title("Chat with your PDFs")
+st.set_page_config(page_title="Chat with your PDFs", page_icon="📄")
+st.title("📄 Chat with your PDFs")
 
 # =========================
 # Helpers
@@ -103,17 +103,6 @@ def cosine_topk(q: np.ndarray, M: np.ndarray, k: int):
     idx = idx[np.argsort(-sims[idx])]
     return idx, sims[idx]
 
-def bm25_topk(query: str, docs: list[str], k: int):
-    tokenized = [d.lower().split() for d in docs]
-    bm25 = BM25Okapi(tokenized)
-    scores = bm25.get_scores(query.lower().split())
-    scores = np.asarray(scores, dtype=np.float32) if len(scores) else np.array([], dtype=np.float32)
-    if scores.size == 0: return np.array([], dtype=int), np.array([])
-    k = min(k, scores.size)
-    idx = np.argpartition(-scores, k - 1)[:k]
-    idx = idx[np.argsort(-scores[idx])]
-    return idx, scores[idx]
-
 # =========================
 # Clients
 # =========================
@@ -157,7 +146,6 @@ def groq_generate_sync(prompt: str, max_tokens: int) -> str:
 # =========================
 if "docs_all" not in st.session_state: st.session_state.docs_all = []
 if "chat_history" not in st.session_state: st.session_state.chat_history = []
-if "query_buffer" not in st.session_state: st.session_state.query_buffer = ""
 
 # =========================
 # Upload PDFs
@@ -217,25 +205,23 @@ for turn in st.session_state.chat_history:
 # Ask a question form
 # =========================
 with st.form("qa", clear_on_submit=True):  # ✅ clears automatically
-    query = st.text_input("Ask a question", key="query_buffer", placeholder="Ask about any uploaded PDF…")
+    query = st.text_input("Ask a question", placeholder="Ask about any uploaded PDF…")
     submitted = st.form_submit_button("Ask", disabled=embeds.size == 0)
 
 if submitted:
     msg = (query or "").strip().lower()
 
-    # special question
-    if "how many" in msg and "document" in msg:
-        count = len(st.session_state.docs_all)
-        answer = f"You currently have {count} PDF document{'s' if count!=1 else ''} uploaded."
-        st.session_state.chat_history.append({"user": query, "answer": answer})
-        st.session_state.query_buffer = ""  # ✅ clear input
-        st.rerun()
-
     # greeting
     if msg == "hi":
         answer = "Hi, happy to hep, start your questions" if len(st.session_state.chat_history)==0 else "please continue"
         st.session_state.chat_history.append({"user": query, "answer": answer})
-        st.session_state.query_buffer = ""
+        st.rerun()
+
+    # count docs
+    if "how many" in msg and "document" in msg:
+        count = len(st.session_state.docs_all)
+        answer = f"You currently have {count} PDF document{'s' if count!=1 else ''} uploaded."
+        st.session_state.chat_history.append({"user": query, "answer": answer})
         st.rerun()
 
     # retrieval
@@ -248,7 +234,6 @@ if submitted:
     if not contexts:
         answer = "Couldn't retrieve relevant context."
         st.session_state.chat_history.append({"user": query, "answer": answer})
-        st.session_state.query_buffer = ""
         st.rerun()
 
     context_text = "\n\n---\n\n".join(x["text"] for x in contexts)
@@ -264,7 +249,6 @@ if submitted:
         answer = f"Generation failed: {e}"
 
     st.session_state.chat_history.append({"user": query, "answer": answer})
-    st.session_state.query_buffer = ""  # ✅ clear input
     st.rerun()
 
 # =========================
