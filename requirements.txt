@@ -1,4 +1,5 @@
 streamlit
 pypdf
-huggingface_hub>=0.23.0
+huggingface_hub>=0.34.0
 numpy
+requests
