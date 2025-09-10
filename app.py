@@ -11,20 +11,19 @@ from pypdf import PdfReader
 # Config
 # ----------------------------
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
-EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"   # embeddings via serverless
-# Use a known-working free model by default; not all google/* are on serverless.
-LLM_MODEL   = "t5-small"
+EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"   # embeddings (serverless OK)
 TOP_K = 4
 MAX_NEW_TOKENS = 256
 TEMPERATURE = 0.2
 
-# If a model 404s, we try these in order automatically.
-LLM_FALLBACKS = [
+# Free serverless models that return text reliably
+SUPPORTED_LLM_MODELS = [
     "t5-small",
     "google/flan-t5-small",
     "bigscience/mt0-small",
     "facebook/bart-base",
 ]
+DEFAULT_LLM = SUPPORTED_LLM_MODELS[0]
 
 # ----------------------------
 # Utils
@@ -52,20 +51,26 @@ def pdf_to_text(file):
             pages.append("")
     return "\n\n".join(pages)
 
-def build_prompt(context, question):
-    SYS_PROMPT = (
-        "You are a concise assistant. Answer the user's question using ONLY the provided context. "
-        "If the answer isn't in the context, say you don't know."
-    )
+def t5_prompt(context, question):
+    # T5/FLAN-style prompt
     return (
-        f"{SYS_PROMPT}\n\n"
+        "Given the following context, answer the question concisely.\n\n"
         f"Context:\n{context}\n\n"
-        f"Question: {question}\n\n"
-        f"Answer:"
+        f"Question: {question}\n"
+        "Answer:"
+    )
+
+def generic_prompt(context, question):
+    return (
+        "You are a concise assistant. Answer using ONLY the provided context. "
+        "If the answer isn't in the context, say you don't know.\n\n"
+        f"Context:\n{context}\n\n"
+        f"Question: {question}\n"
+        "Answer:"
     )
 
 # ----------------------------
-# HF helpers
+# Embeddings via HF serverless
 # ----------------------------
 class HFEmbedder:
     def __init__(self, model_id: str, token: str | None):
@@ -77,7 +82,7 @@ class HFEmbedder:
         vecs = []
         for t in texts:
             out = self.client.feature_extraction(t)
-            # If token-level vectors are returned, mean-pool them
+            # token-level -> mean pool
             if isinstance(out, list) and out and isinstance(out[0], list):
                 arr = np.array(out, dtype=np.float32)  # (tokens, dim)
                 vec = arr.mean(axis=0)
@@ -101,22 +106,34 @@ def cosine_topk(query_vec: np.ndarray, matrix: np.ndarray, k: int):
     return idx, sims[idx]
 
 # ----------------------------
-# Serverless generation via HTTP (robust)
+# Text generation via HTTP (robust + fallback)
 # ----------------------------
+def _looks_like_numeric_matrix(obj) -> bool:
+    # Heuristic to detect embeddings or numeric arrays
+    if isinstance(obj, list) and obj and isinstance(obj[0], list):
+        head = obj[0][:5]
+        return all(isinstance(x, (int, float)) for x in head)
+    return False
+
+def _normalize_generation_output(out):
+    if isinstance(out, list) and out and isinstance(out[0], dict):
+        return out[0].get("generated_text") or out[0].get("translation_text") or out[0].get("summary_text") or str(out[0])
+    if isinstance(out, dict):
+        return out.get("generated_text") or out.get("answer") or out.get("translation_text") or out.get("summary_text") or str(out)
+    if _looks_like_numeric_matrix(out):
+        # This is almost certainly a feature-extraction response
+        raise TypeError("Inference API returned numeric array (feature-extraction), not text.")
+    return str(out)
+
 def hf_generate_http(model_id: str, prompt: str, max_new_tokens: int = MAX_NEW_TOKENS):
-    """
-    Call Hugging Face serverless inference endpoint directly.
-    Works for text-generation and text2text-generation models.
-    Handles 503 "loading" with short retries.
-    """
     url = f"https://api-inference.huggingface.co/models/{model_id}"
     headers = {"Authorization": f"Bearer {HF_TOKEN}"}
     payload = {"inputs": prompt, "parameters": {"max_new_tokens": max_new_tokens}}
 
-    for attempt in range(5):
+    for _ in range(5):
         r = requests.post(url, headers=headers, json=payload, timeout=120)
         if r.status_code == 503:
-            # model warming up
+            # warming up; wait a bit then retry
             try:
                 wait = float(r.json().get("estimated_time", 5))
             except Exception:
@@ -126,31 +143,26 @@ def hf_generate_http(model_id: str, prompt: str, max_new_tokens: int = MAX_NEW_T
         if r.status_code == 404:
             raise FileNotFoundError(f"Model not available on serverless: {model_id}")
         r.raise_for_status()
-
         out = r.json()
-        # Normalize common shapes
-        if isinstance(out, list) and out and isinstance(out[0], dict):
-            return out[0].get("generated_text") or out[0].get("translation_text") or out[0].get("summary_text") or str(out[0])
-        if isinstance(out, dict):
-            return out.get("generated_text") or out.get("answer") or out.get("translation_text") or out.get("summary_text") or str(out)
-        return str(out)
+        return _normalize_generation_output(out)
 
     raise RuntimeError("HF serverless generation retry limit exceeded")
 
 def generate_with_fallback(model_id: str, prompt: str):
-    # Try requested model, then fallbacks if 404/other issues
-    candidates = [model_id] + [m for m in LLM_FALLBACKS if m != model_id]
+    candidates = [m for m in [model_id] + SUPPORTED_LLM_MODELS if m]  # ensure requested first
+    tried = []
     last_err = None
     for mid in candidates:
+        if mid in tried:
+            continue
+        tried.append(mid)
         try:
-            return hf_generate_http(mid, prompt, MAX_NEW_TOKENS), mid
-        except FileNotFoundError:
-            last_err = f"{mid} not on serverless"
-            continue
+            text = hf_generate_http(mid, prompt, MAX_NEW_TOKENS)
+            return text, mid
         except Exception as e:
-            last_err = str(e)
+            last_err = f"{mid}: {e}"
             continue
-    raise RuntimeError(f"All serverless attempts failed. Last error: {last_err}")
+    raise RuntimeError(f"All models failed. Last error: {last_err}")
 
 # ----------------------------
 # App
@@ -175,7 +187,7 @@ col1, col2 = st.columns(2)
 with col1:
     emb_model_id = st.text_input("Embedding model", st.session_state.embed_model_id)
 with col2:
-    llm_model_id = st.text_input("LLM model", LLM_MODEL)
+    llm_model_id = st.selectbox("LLM model (serverless)", SUPPORTED_LLM_MODELS, index=SUPPORTED_LLM_MODELS.index(DEFAULT_LLM))
 
 if uploaded and st.button("Index document"):
     with st.spinner("Reading and indexing..."):
@@ -206,7 +218,12 @@ if go:
     if not context_text.strip():
         st.info("Couldn't retrieve relevant context. Try a different question.")
     else:
-        prompt = build_prompt(context_text, query)
+        # Use T5-friendly prompt for these families
+        if any(t in llm_model_id.lower() for t in ("t5", "flan", "mt0", "bart")):
+            prompt = t5_prompt(context_text, query)
+        else:
+            prompt = generic_prompt(context_text, query)
+
         try:
             answer, used_model = generate_with_fallback(llm_model_id.strip(), prompt)
         except Exception as e:
@@ -215,7 +232,7 @@ if go:
 
         st.markdown("### Answer")
         st.write((answer or "").strip())
-        st.caption(f"Model: {used_model}")
+        st.caption(f"Model used: {used_model}")
 
         with st.expander("Show retrieved context"):
             for i, c in enumerate(contexts, 1):
