@@ -3,3 +3,4 @@ pypdf
 huggingface_hub>=0.34.0
 numpy
 requests
+openai>=1.40.0
