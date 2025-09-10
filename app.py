@@ -9,8 +9,8 @@ from pypdf import PdfReader
 # Config
 # ----------------------------
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
-EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"   # small, fast, good
-LLM_MODEL   = "Qwen/Qwen2-1.5B-Instruct"                 # tiny instruct model
+EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"   # embeddings (serverless OK)
+LLM_MODEL   = "google/flan-t5-base"                     # works on free HF serverless
 TOP_K = 4
 MAX_NEW_TOKENS = 256
 TEMPERATURE = 0.2
@@ -66,8 +66,8 @@ class HFEmbedder:
         vecs = []
         for t in texts:
             out = self.client.feature_extraction(t)
-            # If token-level vectors are returned, mean-pool them
-            if isinstance(out, list) and out and isinstance(out[0], list):
+            # token-level -> mean pool
+            if isinstance(out, list) and out and isinstance(out[0], list]):
                 arr = np.array(out, dtype=np.float32)  # (tokens, dim)
                 vec = arr.mean(axis=0)
             else:
@@ -85,9 +85,18 @@ def cosine_topk(query_vec: np.ndarray, matrix: np.ndarray, k: int):
     if len(sims) == 0:
         return np.array([], dtype=int), np.array([])
     k = min(k, len(sims))
-    idx = np.argpartition(-sims, k - 1)[:k]
-    idx = idx[np.argsort(-sims[idx])]    # sort by similarity desc
+    idx = np.argpartition(-sims, k-1)[:k]
+    idx = idx[np.argsort(-sims[idx])]
     return idx, sims[idx]
+
+def generate_answer(client: InferenceClient, prompt: str):
+    # Single path: use text_generation for serverless API models (incl. FLAN-T5)
+    return client.text_generation(
+        prompt,
+        max_new_tokens=MAX_NEW_TOKENS,
+        temperature=TEMPERATURE,
+        do_sample=False,  # deterministic; flip to True if you want variety
+    )
 
 # ----------------------------
 # App
@@ -100,9 +109,9 @@ if not HF_TOKEN:
     st.stop()
 
 if "docs" not in st.session_state:
-    st.session_state.docs = []           # list[str]
+    st.session_state.docs = []
 if "embeds" not in st.session_state:
-    st.session_state.embeds = None       # np.ndarray or None
+    st.session_state.embeds = None
 if "embed_model_id" not in st.session_state:
     st.session_state.embed_model_id = EMBED_MODEL
 
@@ -119,7 +128,7 @@ if uploaded and st.button("Index document"):
         text = pdf_to_text(uploaded)
         chunks = chunk_text(text)
         embedder = HFEmbedder(emb_model_id, token=HF_TOKEN)
-        vectors = embedder.encode(chunks)  # (n, d)
+        vectors = embedder.encode(chunks)
         st.session_state.docs = chunks
         st.session_state.embeds = vectors
         st.session_state.embed_model_id = emb_model_id
@@ -145,17 +154,12 @@ if go:
     else:
         prompt = build_prompt(context_text, query)
         client = InferenceClient(model=llm_model_id, token=HF_TOKEN)
-        with st.spinner("Generating answer (HF inference)..."):
-            m = llm_model_id.lower()
-            if any(t in m for t in ("t5", "flan", "mt0", "bart")):
-                answer = client.text2text_generation(prompt, max_new_tokens=MAX_NEW_TOKENS)
-            else:
-                answer = client.text_generation(
-                    prompt,
-                    max_new_tokens=MAX_NEW_TOKENS,
-                    temperature=TEMPERATURE,
-                    do_sample=True
-                )
+        try:
+            answer = generate_answer(client, prompt)
+        except Exception as e:
+            st.error(f"Generation failed: {e}")
+            st.stop()
+
         st.markdown("### Answer")
         st.write((answer or "").strip())
 
