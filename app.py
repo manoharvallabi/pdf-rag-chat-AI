@@ -22,7 +22,7 @@ MAX_NEW_TOKENS_DEFAULT = 128
 LOW_CONFIDENCE = 0.08
 
 # Groq: single model (override via Secrets if you like)
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama3-8b-8192")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
 
 # =========================
 # Text utils
