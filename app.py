@@ -1,5 +1,4 @@
 import os
-import time
 import numpy as np
 import streamlit as st
 from huggingface_hub import InferenceClient
@@ -9,8 +8,8 @@ from pypdf import PdfReader
 # Config
 # ----------------------------
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
-EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"   # embeddings (serverless OK)
-LLM_MODEL   = "google/flan-t5-base"                     # works on free HF serverless
+EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+LLM_MODEL   = "google/flan-t5-base"   # works on HF serverless
 TOP_K = 4
 MAX_NEW_TOKENS = 256
 TEMPERATURE = 0.2
@@ -66,8 +65,8 @@ class HFEmbedder:
         vecs = []
         for t in texts:
             out = self.client.feature_extraction(t)
-            # token-level -> mean pool
-            if isinstance(out, list) and out and isinstance(out[0], list]):
+            # If token-level vectors are returned, mean-pool them
+            if isinstance(out, list) and out and isinstance(out[0], list):
                 arr = np.array(out, dtype=np.float32)  # (tokens, dim)
                 vec = arr.mean(axis=0)
             else:
@@ -89,14 +88,44 @@ def cosine_topk(query_vec: np.ndarray, matrix: np.ndarray, k: int):
     idx = idx[np.argsort(-sims[idx])]
     return idx, sims[idx]
 
-def generate_answer(client: InferenceClient, prompt: str):
-    # Single path: use text_generation for serverless API models (incl. FLAN-T5)
-    return client.text_generation(
-        prompt,
-        max_new_tokens=MAX_NEW_TOKENS,
-        temperature=TEMPERATURE,
-        do_sample=False,  # deterministic; flip to True if you want variety
-    )
+def _unwrap(resp):
+    # HF can return str, dict, or list[dict]
+    if isinstance(resp, str):
+        return resp
+    if isinstance(resp, dict):
+        return resp.get("generated_text") or str(resp)
+    if isinstance(resp, list) and resp and isinstance(resp[0], dict):
+        return resp[0].get("generated_text") or str(resp[0])
+    return str(resp)
+
+def generate_answer(client: InferenceClient, model_id: str, prompt: str):
+    m = model_id.lower()
+    # Prefer the text2text path for FLAN/T5/MT0/BART
+    if any(t in m for t in ("t5", "flan", "mt0", "bart", "mbart")):
+        try:
+            # Some hub versions expose this:
+            return client.text2text_generation(prompt, max_new_tokens=MAX_NEW_TOKENS)
+        except Exception:
+            # Generic call to the correct task
+            resp = client.post(
+                json={"inputs": prompt, "parameters": {"max_new_tokens": MAX_NEW_TOKENS}},
+                task="text2text-generation",
+            )
+            return _unwrap(resp)
+    # Fallback: causal LM path
+    try:
+        return client.text_generation(
+            prompt,
+            max_new_tokens=MAX_NEW_TOKENS,
+            temperature=TEMPERATURE,
+            do_sample=False,
+        )
+    except Exception:
+        resp = client.post(
+            json={"inputs": prompt, "parameters": {"max_new_tokens": MAX_NEW_TOKENS, "temperature": TEMPERATURE, "do_sample": False}},
+            task="text-generation",
+        )
+        return _unwrap(resp)
 
 # ----------------------------
 # App
@@ -155,7 +184,7 @@ if go:
         prompt = build_prompt(context_text, query)
         client = InferenceClient(model=llm_model_id, token=HF_TOKEN)
         try:
-            answer = generate_answer(client, prompt)
+            answer = generate_answer(client, llm_model_id, prompt)
         except Exception as e:
             st.error(f"Generation failed: {e}")
             st.stop()
