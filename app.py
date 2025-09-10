@@ -12,8 +12,9 @@ from groq import Groq
 # =========================
 # Config
 # =========================
-HF_TOKEN = os.environ.get("HF_TOKEN", "")            # optional but recommended
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")    # required for answers
+HF_TOKEN = os.environ.get("HF_TOKEN", "")             # optional but recommended
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")     # required for answers
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")  # active Groq model
 
 EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"   # HF serverless embeddings
 DEFAULT_EMBED_DIM = 384
@@ -21,11 +22,8 @@ TOP_K_DEFAULT = 3
 MAX_NEW_TOKENS_DEFAULT = 128
 LOW_CONFIDENCE = 0.08
 
-# Groq: single model (override via Secrets if you like)
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
-
 # =========================
-# Text utils
+# Small text helpers
 # =========================
 def clean_text(s: str) -> str:
     if not s:
@@ -208,25 +206,24 @@ def groq_generate_sync(prompt: str, max_tokens: int):
 # App
 # =========================
 st.set_page_config(page_title="PDF RAG (HF embeddings + Groq)", page_icon="📄")
-st.title("📄 Chat with your PDF — HF embeddings + Groq generation")
+st.title("📄 Chat with your PDF")
 
-# Speed controls
-colA, colB, colC = st.columns(3)
-with colA:
+# Sidebar (tidier controls)
+with st.sidebar:
+    st.subheader("Settings")
     fast_mode = st.checkbox("Fast mode", value=True, help="Smaller context, fewer tokens.")
-with colB:
     long_answers = st.checkbox("Long answers", value=False, help="Increase max tokens if needed.")
-with colC:
     force_answer = st.checkbox("Answer at low confidence", value=False)
+    show_debug = st.checkbox("Show debug info", value=False)
+    st.caption(f"Groq model: `{GROQ_MODEL}`")
+    if not GROQ_API_KEY:
+        st.warning("Add GROQ_API_KEY in Secrets to enable answers.")
+    if not HF_TOKEN:
+        st.info("Tip: add HF_TOKEN in Secrets to avoid HF embedding cold starts/rate limits.")
 
 TOP_K = 2 if fast_mode else TOP_K_DEFAULT
 MAX_NEW_TOKENS = 256 if long_answers else MAX_NEW_TOKENS_DEFAULT
 CONTEXT_CHAR_LIMIT = 3500 if fast_mode else 7000  # trim prompt size for speed
-
-if not GROQ_API_KEY:
-    st.warning("Add GROQ_API_KEY in Settings → Secrets to enable answers.")
-if not HF_TOKEN:
-    st.info("Tip: add HF_TOKEN in Secrets to avoid HF embedding cold starts/rate limits.")
 
 # Session state
 if "docs" not in st.session_state:
@@ -237,15 +234,18 @@ if "last_file" not in st.session_state:
     st.session_state.last_file = None
 if "uploaded_bytes" not in st.session_state:
     st.session_state.uploaded_bytes = None
+if "meta" not in st.session_state:
+    st.session_state.meta = {}
+if "turn" not in st.session_state:
+    st.session_state.turn = 0
 
 uploaded = st.file_uploader("Upload a PDF", type=["pdf"])
-show_debug = st.checkbox("Show debug info", value=False)
 
 @st.cache_data(show_spinner=False)
 def _extract_pages_cached(data: bytes):
     return pdf_to_pages(data)
 
-# auto-index after upload
+# Auto-index on upload
 def auto_index():
     with st.spinner("Reading and indexing…"):
         data = st.session_state.uploaded_bytes
@@ -274,26 +274,67 @@ def auto_index():
 
         st.session_state.docs = pairs
         st.session_state.embeds = vecs
-        st.success(f"Indexed {len(texts)} chunks across {len(pages)} pages.")
+        st.session_state.meta = {
+            "filename": st.session_state.last_file or "unknown.pdf",
+            "pages": len(pages),
+            "chunks": len(texts),
+        }
 
+# New upload?
 if uploaded is not None:
-    # read bytes once and cache in session (avoid double-reads)
     if st.session_state.last_file != uploaded.name:
-        st.session_state.uploaded_bytes = uploaded.getvalue()  # safe one-time read
+        st.session_state.uploaded_bytes = uploaded.getvalue()
         st.session_state.last_file = uploaded.name
         st.session_state.docs = []
         st.session_state.embeds = None
-
-    if st.session_state.embeds is None and st.session_state.uploaded_bytes:
         auto_index()
 
-query = st.text_input("Ask a question about the PDF")
-if st.button("Ask"):
-    if st.session_state.embeds is None or len(st.session_state.docs) == 0:
-        st.error("Upload a PDF first.")
+# Show file card
+if st.session_state.meta:
+    m = st.session_state.meta
+    st.info(f"**Loaded:** {m.get('filename','?')}  •  Pages: {m.get('pages','?')}  •  Chunks: {m.get('chunks','?')}")
+
+# Example question chips
+if st.session_state.embeds is not None and len(st.session_state.docs) > 0:
+    ex1, ex2, ex3 = st.columns(3)
+    if ex1.button("Summarize this document", use_container_width=True):
+        st.session_state["prefill"] = "Summarize this document in 3 sentences."
+        st.rerun()
+    if ex2.button("Key skills mentioned", use_container_width=True):
+        st.session_state["prefill"] = "List the key skills mentioned."
+        st.rerun()
+    if ex3.button("What is the document name?", use_container_width=True):
+        st.session_state["prefill"] = "What is the document name?"
+        st.rerun()
+
+# Ask form (Enter to submit)
+with st.form("qa", clear_on_submit=False):
+    query = st.text_input(
+        "Ask a question about the PDF",
+        value=st.session_state.get("prefill", ""),
+        placeholder="Try: Summarize this document in 3 sentences",
+    )
+    st.session_state["prefill"] = ""  # reset after rendering
+    ready = st.session_state.embeds is not None and len(st.session_state.docs) > 0
+    submitted = st.form_submit_button("Ask", use_container_width=True, disabled=not ready)
+
+if submitted:
+    # Greeting hook
+    msg = (query or "").strip().lower()
+    if msg == "hi":
+        st.markdown("### Answer")
+        if st.session_state.turn == 0:
+            st.write("Hi, happy to hep, start your questions")
+        else:
+            st.write("please continue")
+        st.session_state.turn += 1
         st.stop()
 
-    # retrieve
+    if not ready:
+        st.error("Upload and index a PDF first.")
+        st.stop()
+
+    # Retrieve
     embedder = get_embedder(EMBED_MODEL, HF_TOKEN)
     qvec = embedder.encode(query)  # (1, d)
     if qvec.size == 0:
@@ -309,6 +350,12 @@ if st.button("Ask"):
     context_text = "\n\n---\n\n".join(x["text"] for x in contexts)
     if len(context_text) > CONTEXT_CHAR_LIMIT:
         context_text = context_text[:CONTEXT_CHAR_LIMIT]
+
+    # Add basic metadata to the context so filename questions can be answered
+    meta = st.session_state.meta or {}
+    meta_line = f"[File: {meta.get('filename','unknown.pdf')}; Pages: {meta.get('pages','?')}]"
+    context_text = meta_line + "\n\n" + context_text
+
     best_sim = float(sims.max()) if sims.size else 0.0
 
     if show_debug:
@@ -322,13 +369,12 @@ if st.button("Ask"):
 
     if not force_answer and (best_sim < LOW_CONFIDENCE or not context_text.strip()):
         st.markdown("### Answer")
-        st.write("I don't know based on this document.")
-        with st.expander("Show retrieved context"):
-            for i, c in enumerate(contexts, 1):
-                st.markdown(f"**Chunk {i} (score: {float(sims[i-1]):.3f})**\n\n{c['text']}")
+        st.write("I don't know")
+        st.caption("Chunk scores: " + " · ".join(f"{float(s):.3f}" for s in sims))
+        st.session_state.turn += 1
         st.stop()
 
-    # generate (Groq-only)
+    # Generate
     if not GROQ_API_KEY:
         st.error("GROQ_API_KEY missing. Add it in Settings → Secrets.")
         st.stop()
@@ -336,26 +382,33 @@ if st.button("Ask"):
     prompt = build_prompt(context_text, query)
 
     st.markdown("### Answer")
-    stream_success = False
-    try:
-        def _streamer():
-            for chunk in groq_stream(prompt, MAX_NEW_TOKENS):
-                yield chunk
-        st.write_stream(_streamer())
-        stream_success = True
-    except Exception:
-        pass
-
-    if not stream_success:
+    with st.spinner("Thinking with Groq…"):
+        stream_ok = False
         try:
-            text = groq_generate_sync(prompt, MAX_NEW_TOKENS)
-            st.write(text)
-        except Exception as e:
-            st.error(f"Generation failed: {e}")
-            st.stop()
+            def _streamer():
+                for chunk in groq_stream(prompt, MAX_NEW_TOKENS):
+                    yield chunk
+            st.write_stream(_streamer())
+            stream_ok = True
+        except Exception:
+            pass
+        if not stream_ok:
+            try:
+                text = groq_generate_sync(prompt, MAX_NEW_TOKENS)
+                st.write(text)
+            except Exception as e:
+                st.error(f"Generation failed: {e}")
+                st.stop()
 
-    st.caption(f"Groq model: {GROQ_MODEL}")
+    st.caption("Chunk scores: " + " · ".join(f"{float(s):.3f}" for s in sims))
+    st.caption(f"Model: {GROQ_MODEL}")
+    st.session_state.turn += 1
 
-    with st.expander("Show retrieved context"):
-        for i, c in enumerate(contexts, 1):
-            st.markdown(f"**Chunk {i} (score: {float(sims[i-1]):.3f})**\n\n{c['text']}")
+# Tiny footer actions
+col_clear, col_sp = st.columns([1, 5])
+with col_clear:
+    if st.button("Clear state"):
+        for k in ["docs", "embeds", "last_file", "uploaded_bytes", "meta", "prefill", "turn"]:
+            if k in st.session_state:
+                del st.session_state[k]
+        st.rerun()
