@@ -5,26 +5,23 @@ import requests
 import streamlit as st
 from huggingface_hub import InferenceClient
 from pypdf import PdfReader
+from openai import OpenAI
 
-# ----------------------------
-# Config
-# ----------------------------
+# ========= Config =========
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
-EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"   # embeddings via serverless
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+
+EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"   # embeddings via HF serverless
 TOP_K = 4
 MAX_NEW_TOKENS = 256
 TEMPERATURE = 0.2
 
-# Keep to models that work on HF's free serverless API
-SUPPORTED_LLM_MODELS = [
-    "t5-small",
-    "google/flan-t5-small",
-]
-DEFAULT_LLM = SUPPORTED_LLM_MODELS[0]
+# LLM providers
+PROVIDERS = ["OpenAI (gpt-4o-mini)", "HuggingFace serverless (t5-small)"]
+DEFAULT_PROVIDER = PROVIDERS[0]
+HF_FALLBACK_MODEL = "t5-small"
 
-# ----------------------------
-# Helpers
-# ----------------------------
+# ========= Small helpers =========
 def chunk_text(text, chunk_size=900, overlap=150):
     words = text.split()
     chunks, start = [], 0
@@ -48,17 +45,17 @@ def pdf_to_text(file):
             pages.append("")
     return "\n\n".join(pages)
 
-def t5_prompt(context, question):
+def build_prompt(context, question):
+    # Works well for both OpenAI and T5-family
     return (
-        "Given the following context, answer the question concisely.\n\n"
+        "You are a concise assistant. Answer using ONLY the provided context. "
+        "If the answer isn't in the context, say you don't know.\n\n"
         f"Context:\n{context}\n\n"
         f"Question: {question}\n"
         "Answer:"
     )
 
-# ----------------------------
-# Embeddings (serverless)
-# ----------------------------
+# ========= Embeddings (HF serverless) =========
 class HFEmbedder:
     def __init__(self, model_id: str, token: str | None):
         self.client = InferenceClient(model=model_id, token=token)
@@ -92,15 +89,29 @@ def cosine_topk(query_vec: np.ndarray, matrix: np.ndarray, k: int):
     idx = idx[np.argsort(-sims[idx])]
     return idx, sims[idx]
 
-# ----------------------------
-# Text generation via HTTP (force task)
-# ----------------------------
+# ========= Generation: OpenAI (reliable) =========
+def openai_generate(prompt: str) -> str:
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY not set in secrets")
+    client = OpenAI(api_key=OPENAI_API_KEY)
+    resp = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": "You are a concise assistant. Be accurate and cite only from provided context."},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=TEMPERATURE,
+        max_tokens=MAX_NEW_TOKENS,
+    )
+    return resp.choices[0].message.content.strip()
+
+# ========= Generation: HF serverless fallback (t5-small) =========
 def _http_post(url, payload):
     headers = {"Authorization": f"Bearer {HF_TOKEN}"}
     for _ in range(5):
         r = requests.post(url, headers=headers, json=payload, timeout=120)
         if r.status_code == 503:
-            # model is warming up
+            # model warming up
             try:
                 wait = float(r.json().get("estimated_time", 5))
             except Exception:
@@ -108,45 +119,24 @@ def _http_post(url, payload):
             time.sleep(min(20, wait + 1))
             continue
         if r.status_code == 404:
-            raise FileNotFoundError("Model not available on serverless")
+            raise FileNotFoundError("HF serverless: model not available")
         r.raise_for_status()
         return r.json()
-    raise RuntimeError("HF serverless generation retry limit exceeded")
+    raise RuntimeError("HF serverless retry limit exceeded")
 
-def _normalize_output(out):
-    if isinstance(out, list) and out and isinstance(out[0], dict):
-        return out[0].get("generated_text") or out[0].get("translation_text") or out[0].get("summary_text") or str(out[0])
-    if isinstance(out, dict):
-        return out.get("generated_text") or out.get("translation_text") or out.get("summary_text") or out.get("answer") or str(out)
-    # If it’s numeric arrays, it was feature-extraction by mistake
-    if isinstance(out, list) and out and isinstance(out[0], list) and all(isinstance(x, (int, float)) for x in out[0][:5]):
-        raise TypeError("Got embeddings, not text")
-    return str(out)
-
-def generate_text(model_id: str, prompt: str, max_new_tokens: int = MAX_NEW_TOKENS):
-    # 1) force text2text-generation
-    payload = {"model": model_id, "inputs": prompt, "parameters": {"max_new_tokens": max_new_tokens}}
+def hf_t5_generate(model_id: str, prompt: str) -> str:
+    payload = {"model": model_id, "inputs": prompt, "parameters": {"max_new_tokens": MAX_NEW_TOKENS}}
     out = _http_post("https://api-inference.huggingface.co/pipeline/text2text-generation", payload)
-    return _normalize_output(out), "text2text-generation"
+    # normalize
+    if isinstance(out, list) and out and isinstance(out[0], dict):
+        return (out[0].get("generated_text") or str(out[0])).strip()
+    if isinstance(out, dict):
+        return (out.get("generated_text") or str(out)).strip()
+    return str(out).strip()
 
-def generate_with_fallback(model_id: str, prompt: str):
-    # Try requested model, then fall back to supported list
-    candidates = [model_id] + [m for m in SUPPORTED_LLM_MODELS if m != model_id]
-    last_err = None
-    for mid in candidates:
-        try:
-            text, route = generate_text(mid, prompt, MAX_NEW_TOKENS)
-            return text, mid, route
-        except Exception as e:
-            last_err = f"{mid}: {e}"
-            continue
-    raise RuntimeError(f"All models failed. Last error: {last_err}")
-
-# ----------------------------
-# App
-# ----------------------------
-st.set_page_config(page_title="PDF RAG (HF Free, Lite)", page_icon="📄")
-st.title("📄 Chat with your PDF — Hugging Face (Lite, no sqlite)")
+# ========= Streamlit UI =========
+st.set_page_config(page_title="PDF RAG (HF+OpenAI)", page_icon="📄")
+st.title("📄 Chat with your PDF — HF embeddings + OpenAI gen (free-ish)")
 
 if not HF_TOKEN:
     st.warning("Add your Hugging Face token as HF_TOKEN in Streamlit Secrets.")
@@ -167,13 +157,9 @@ col1, col2 = st.columns(2)
 with col1:
     emb_model_id = st.text_input("Embedding model", st.session_state.embed_model_id)
 with col2:
-    llm_model_id = st.selectbox(
-        "LLM model (serverless)",
-        SUPPORTED_LLM_MODELS,
-        index=SUPPORTED_LLM_MODELS.index(DEFAULT_LLM),
-    )
+    provider = st.selectbox("LLM provider", PROVIDERS, index=PROVIDERS.index(DEFAULT_PROVIDER))
 
-# --- Auto-index on upload or when embedding model changes ---
+# Auto-index on upload or embedding change
 def _auto_index():
     with st.spinner("Reading and indexing..."):
         text = pdf_to_text(uploaded)
@@ -212,16 +198,22 @@ if go:
     if not context_text.strip():
         st.info("Couldn't retrieve relevant context. Try a different question.")
     else:
-        prompt = t5_prompt(context_text, query)
+        prompt = build_prompt(context_text, query)
         try:
-            answer, used_model, route = generate_with_fallback(llm_model_id.strip(), prompt)
+            if provider.startswith("OpenAI"):
+                answer = openai_generate(prompt)
+                used = "OpenAI gpt-4o-mini"
+            else:
+                # HF serverless fallback (free); use a safe small model
+                answer = hf_t5_generate(HF_FALLBACK_MODEL, prompt)
+                used = f"HF serverless ({HF_FALLBACK_MODEL})"
         except Exception as e:
             st.error(f"Generation failed: {e}")
             st.stop()
 
         st.markdown("### Answer")
         st.write((answer or "").strip())
-        st.caption(f"Model: {used_model} • Route: {route}")
+        st.caption(f"Generator: {used}")
 
         with st.expander("Show retrieved context"):
             for i, c in enumerate(contexts, 1):
