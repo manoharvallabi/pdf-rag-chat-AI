@@ -15,16 +15,15 @@ TOP_K = 4
 MAX_NEW_TOKENS = 256
 TEMPERATURE = 0.2
 
-# Known-good free serverless models
+# Keep to models that work on HF's free serverless API
 SUPPORTED_LLM_MODELS = [
-    "google/flan-t5-small",
     "t5-small",
-    "bigscience/mt0-small",
+    "google/flan-t5-small",
 ]
 DEFAULT_LLM = SUPPORTED_LLM_MODELS[0]
 
 # ----------------------------
-# Utils
+# Helpers
 # ----------------------------
 def chunk_text(text, chunk_size=900, overlap=150):
     words = text.split()
@@ -70,8 +69,9 @@ class HFEmbedder:
         vecs = []
         for t in texts:
             out = self.client.feature_extraction(t)
+            # If token-level vectors are returned, mean-pool them
             if isinstance(out, list) and out and isinstance(out[0], list):
-                arr = np.array(out, dtype=np.float32)
+                arr = np.array(out, dtype=np.float32)  # (tokens, dim)
                 vec = arr.mean(axis=0)
             else:
                 vec = np.array(out, dtype=np.float32)
@@ -82,9 +82,9 @@ def cosine_topk(query_vec: np.ndarray, matrix: np.ndarray, k: int):
     def _norm(x):
         n = np.linalg.norm(x, axis=-1, keepdims=True) + 1e-9
         return x / n
-    q = _norm(query_vec.reshape(1, -1))
-    M = _norm(matrix)
-    sims = (M @ q.T).ravel()
+    q = _norm(query_vec.reshape(1, -1))  # (1, d)
+    M = _norm(matrix)                    # (n, d)
+    sims = (M @ q.T).ravel()             # (n,)
     if len(sims) == 0:
         return np.array([], dtype=int), np.array([])
     k = min(k, len(sims))
@@ -100,13 +100,15 @@ def _http_post(url, payload):
     for _ in range(5):
         r = requests.post(url, headers=headers, json=payload, timeout=120)
         if r.status_code == 503:
-            # warming up
+            # model is warming up
             try:
                 wait = float(r.json().get("estimated_time", 5))
             except Exception:
                 wait = 5
             time.sleep(min(20, wait + 1))
             continue
+        if r.status_code == 404:
+            raise FileNotFoundError("Model not available on serverless")
         r.raise_for_status()
         return r.json()
     raise RuntimeError("HF serverless generation retry limit exceeded")
@@ -116,26 +118,19 @@ def _normalize_output(out):
         return out[0].get("generated_text") or out[0].get("translation_text") or out[0].get("summary_text") or str(out[0])
     if isinstance(out, dict):
         return out.get("generated_text") or out.get("translation_text") or out.get("summary_text") or out.get("answer") or str(out)
+    # If it’s numeric arrays, it was feature-extraction by mistake
+    if isinstance(out, list) and out and isinstance(out[0], list) and all(isinstance(x, (int, float)) for x in out[0][:5]):
+        raise TypeError("Got embeddings, not text")
     return str(out)
 
 def generate_text(model_id: str, prompt: str, max_new_tokens: int = MAX_NEW_TOKENS):
-    payload = {"model": model_id, "inputs": prompt, "parameters": {"max_new_tokens": max_new_tokens}}
     # 1) force text2text-generation
-    try:
-        out = _http_post("https://api-inference.huggingface.co/pipeline/text2text-generation", payload)
-        return _normalize_output(out), "text2text-generation"
-    except Exception as e1:
-        # 2) try text-generation pipeline
-        try:
-            out = _http_post("https://api-inference.huggingface.co/pipeline/text-generation", payload)
-            return _normalize_output(out), "text-generation"
-        except Exception as e2:
-            # 3) final fallback: model endpoint (lets hub infer)
-            url = f"https://api-inference.huggingface.co/models/{model_id}"
-            out = _http_post(url, {"inputs": prompt, "parameters": {"max_new_tokens": max_new_tokens}})
-            return _normalize_output(out), "model-route"
+    payload = {"model": model_id, "inputs": prompt, "parameters": {"max_new_tokens": max_new_tokens}}
+    out = _http_post("https://api-inference.huggingface.co/pipeline/text2text-generation", payload)
+    return _normalize_output(out), "text2text-generation"
 
 def generate_with_fallback(model_id: str, prompt: str):
+    # Try requested model, then fall back to supported list
     candidates = [model_id] + [m for m in SUPPORTED_LLM_MODELS if m != model_id]
     last_err = None
     for mid in candidates:
@@ -163,6 +158,8 @@ if "embeds" not in st.session_state:
     st.session_state.embeds = None
 if "embed_model_id" not in st.session_state:
     st.session_state.embed_model_id = EMBED_MODEL
+if "last_file_name" not in st.session_state:
+    st.session_state.last_file_name = None
 
 uploaded = st.file_uploader("Upload a PDF", type=["pdf"])
 
@@ -170,9 +167,14 @@ col1, col2 = st.columns(2)
 with col1:
     emb_model_id = st.text_input("Embedding model", st.session_state.embed_model_id)
 with col2:
-    llm_model_id = st.selectbox("LLM model (serverless)", SUPPORTED_LLM_MODELS, index=SUPPORTED_LLM_MODELS.index(DEFAULT_LLM))
+    llm_model_id = st.selectbox(
+        "LLM model (serverless)",
+        SUPPORTED_LLM_MODELS,
+        index=SUPPORTED_LLM_MODELS.index(DEFAULT_LLM),
+    )
 
-if uploaded and st.button("Index document"):
+# --- Auto-index on upload or when embedding model changes ---
+def _auto_index():
     with st.spinner("Reading and indexing..."):
         text = pdf_to_text(uploaded)
         chunks = chunk_text(text)
@@ -181,14 +183,23 @@ if uploaded and st.button("Index document"):
         st.session_state.docs = chunks
         st.session_state.embeds = vectors
         st.session_state.embed_model_id = emb_model_id
+        st.session_state.last_file_name = uploaded.name
         st.success(f"Indexed {len(chunks)} chunks.")
+
+if uploaded is not None:
+    if (
+        st.session_state.last_file_name != uploaded.name
+        or st.session_state.embed_model_id != emb_model_id
+        or st.session_state.embeds is None
+    ):
+        _auto_index()
 
 query = st.text_input("Ask a question about the PDF")
 go = st.button("Ask")
 
 if go:
     if st.session_state.embeds is None or len(st.session_state.docs) == 0:
-        st.error("Upload and index a PDF first.")
+        st.error("Upload a PDF first.")
         st.stop()
 
     with st.spinner("Retrieving..."):
