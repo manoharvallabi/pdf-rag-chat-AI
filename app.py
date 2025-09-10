@@ -12,18 +12,18 @@ from groq import Groq
 # =========================
 # Config
 # =========================
-HF_TOKEN = os.environ.get("HF_TOKEN", "")            # set in Streamlit Secrets (optional but helps)
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")    # set in Streamlit Secrets (required)
+HF_TOKEN = os.environ.get("HF_TOKEN", "")            # optional but recommended
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")    # required for answers
 
 EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"   # HF serverless embeddings
 DEFAULT_EMBED_DIM = 384
-TOP_K_DEFAULT = 3          # fewer chunks -> smaller prompt -> faster
+TOP_K_DEFAULT = 3
 MAX_NEW_TOKENS_DEFAULT = 128
 LOW_CONFIDENCE = 0.08
 
 GROQ_MODELS = [
-    "llama3-8b-8192",        # fast, default
-    "gemma2-9b-it",          # solid fallback
+    "llama3-8b-8192",
+    "gemma2-9b-it",
 ]
 
 # =========================
@@ -32,8 +32,8 @@ GROQ_MODELS = [
 def clean_text(s: str) -> str:
     if not s:
         return ""
-    s = re.sub(r"(\w)-\n(\w)", r"\1\2", s)   # join hyphenated line breaks
-    s = re.sub(r"[ \t]*\n[ \t]*", " ", s)    # join intra-paragraph newlines
+    s = re.sub(r"(\w)-\n(\w)", r"\1\2", s)   # join hyphenation across lines
+    s = re.sub(r"[ \t]*\n[ \t]*", " ", s)    # collapse single newlines
     s = re.sub(r"[ \t]{2,}", " ", s)         # collapse spaces
     return s.strip()
 
@@ -49,7 +49,6 @@ def merge_to_chunks(paras: list[str], target: int = 900, overlap: int = 120) -> 
             buf.append(p); cur += len(p) + 1
         else:
             chunks.append(" ".join(buf))
-            # overlap by reusing last ~overlap chars
             carry, acc = [], 0
             for para in reversed(buf):
                 carry.insert(0, para); acc += len(para) + 1
@@ -59,10 +58,8 @@ def merge_to_chunks(paras: list[str], target: int = 900, overlap: int = 120) -> 
     if buf: chunks.append(" ".join(buf))
     return chunks
 
-def pdf_to_pages(file) -> list[str]:
-    data = file.read()
-
-    # Try PyPDF
+def pdf_to_pages(data: bytes) -> list[str]:
+    """Try PyPDF per-page; fall back to pdfminer text (split on form feed)."""
     pages = []
     try:
         reader = PdfReader(io.BytesIO(data))
@@ -78,7 +75,6 @@ def pdf_to_pages(file) -> list[str]:
     if sum(len(p or "") for p in pages) >= 500:
         return pages
 
-    # Fallback: pdfminer
     try:
         text_all = pdfminer_extract_text(io.BytesIO(data)) or ""
         pages_pm = [clean_text(x) for x in text_all.split("\f")]
@@ -86,7 +82,6 @@ def pdf_to_pages(file) -> list[str]:
             return pages_pm
     except Exception:
         pass
-
     return pages
 
 def build_prompt(context: str, question: str) -> str:
@@ -111,6 +106,11 @@ def get_groq():
         raise RuntimeError("GROQ_API_KEY not set in Secrets.")
     return Groq(api_key=GROQ_API_KEY)
 
+# Keep one embedder around
+@st.cache_resource
+def get_embedder(model_id: str, token: str | None):
+    return HFEmbedder(model_id, token)
+
 # =========================
 # Embeddings (HF serverless)
 # =========================
@@ -122,11 +122,10 @@ class HFEmbedder:
 
     def _pool(self, out):
         if isinstance(out, list) and out:
-            if isinstance(out[0], list):
+            if isinstance(out[0], list):      # token-level vectors -> mean-pool
                 arr = np.asarray(out, dtype=np.float32)
                 return arr.mean(axis=0)
-            else:
-                return np.asarray(out, dtype=np.float32)
+            return np.asarray(out, dtype=np.float32)
         return np.asarray([], dtype=np.float32)
 
     def encode_one(self, text: str, retries: int = 3, backoff: float = 0.6) -> np.ndarray:
@@ -151,7 +150,7 @@ class HFEmbedder:
         vecs = [self.encode_one(t) for t in texts]
         dim = self._dim or self.default_dim
         vecs = [v if v.size else np.zeros((dim,), dtype=np.float32) for v in vecs]
-        return np.vstack(vecs)
+        return np.vstack(vecs) if vecs else np.zeros((0, dim), dtype=np.float32)
 
 def normalize_rows(M: np.ndarray) -> np.ndarray:
     if M.size == 0:
@@ -171,11 +170,10 @@ def cosine_topk(q: np.ndarray, M: np.ndarray, k: int):
     return idx, sims[idx]
 
 # =========================
-# Groq generation (streaming)
+# Groq generation (streaming + sync fallback)
 # =========================
 def groq_stream(prompt: str, model: str, max_tokens: int):
     client = get_groq()
-    # Stream like OpenAI chunks
     resp = client.chat.completions.create(
         model=model,
         messages=[
@@ -187,10 +185,13 @@ def groq_stream(prompt: str, model: str, max_tokens: int):
         stream=True,
     )
     for chunk in resp:
+        # Some chunks don't carry content; guard it
         try:
-            delta = chunk.choices[0].delta
-            if delta and getattr(delta, "content", None):
-                yield delta.content
+            ch = chunk.choices[0]
+            delta = getattr(ch, "delta", None)
+            content = getattr(delta, "content", None) if delta else None
+            if content:
+                yield content
         except Exception:
             continue
 
@@ -231,28 +232,35 @@ with colC:
 
 TOP_K = 2 if fast_mode else TOP_K_DEFAULT
 MAX_NEW_TOKENS = 256 if long_answers else MAX_NEW_TOKENS_DEFAULT
-CONTEXT_CHAR_LIMIT = 3500 if fast_mode else 7000  # trim prompt length
+CONTEXT_CHAR_LIMIT = 3500 if fast_mode else 7000  # trim prompt size for speed
 
 if not GROQ_API_KEY:
-    st.warning("Add GROQ_API_KEY in Secrets to enable answers.")
+    st.warning("Add GROQ_API_KEY in Settings → Secrets to enable answers.")
 if not HF_TOKEN:
     st.info("Tip: add HF_TOKEN in Secrets to avoid HF embedding cold starts/rate limits.")
 
-# session state
+# Session state
 if "docs" not in st.session_state:
     st.session_state.docs = []         # list of {"text","page"}
 if "embeds" not in st.session_state:
     st.session_state.embeds = None     # (N, d)
 if "last_file" not in st.session_state:
     st.session_state.last_file = None
+if "uploaded_bytes" not in st.session_state:
+    st.session_state.uploaded_bytes = None
 
 uploaded = st.file_uploader("Upload a PDF", type=["pdf"])
 show_debug = st.checkbox("Show debug info", value=False)
 
+@st.cache_data(show_spinner=False)
+def _extract_pages_cached(data: bytes):
+    return pdf_to_pages(data)
+
 # auto-index after upload
 def auto_index():
     with st.spinner("Reading and indexing…"):
-        pages = pdf_to_pages(uploaded)
+        data = st.session_state.uploaded_bytes
+        pages = _extract_pages_cached(data)
         pairs = []
         for i, page_text in enumerate(pages, start=1):
             if not page_text:
@@ -269,7 +277,7 @@ def auto_index():
             st.session_state.docs, st.session_state.embeds = [], None
             return
 
-        embedder = HFEmbedder(EMBED_MODEL, token=HF_TOKEN)
+        embedder = get_embedder(EMBED_MODEL, HF_TOKEN)
         vecs = embedder.encode(texts)  # (N, d)
         if vecs.size == 0 or vecs.ndim != 2:
             st.error("Embedding failed. Check HF_TOKEN or try again.")
@@ -277,11 +285,17 @@ def auto_index():
 
         st.session_state.docs = pairs
         st.session_state.embeds = vecs
-        st.session_state.last_file = uploaded.name
         st.success(f"Indexed {len(texts)} chunks across {len(pages)} pages.")
 
 if uploaded is not None:
-    if st.session_state.last_file != uploaded.name or st.session_state.embeds is None:
+    # read bytes once and cache in session (avoid double-reads)
+    if st.session_state.last_file != uploaded.name:
+        st.session_state.uploaded_bytes = uploaded.getvalue()  # safe one-time read
+        st.session_state.last_file = uploaded.name
+        st.session_state.docs = []
+        st.session_state.embeds = None
+
+    if st.session_state.embeds is None:
         auto_index()
 
 query = st.text_input("Ask a question about the PDF")
@@ -291,7 +305,7 @@ if st.button("Ask"):
         st.stop()
 
     # retrieve
-    embedder = HFEmbedder(EMBED_MODEL, token=HF_TOKEN)
+    embedder = get_embedder(EMBED_MODEL, HF_TOKEN)
     qvec = embedder.encode(query)  # (1, d)
     if qvec.size == 0:
         st.error("Query embedding failed. Try again.")
@@ -304,10 +318,8 @@ if st.button("Ask"):
 
     contexts = [st.session_state.docs[i] for i in idx]
     context_text = "\n\n---\n\n".join(x["text"] for x in contexts)
-    # Trim the prompt in fast mode to keep it snappy
     if len(context_text) > CONTEXT_CHAR_LIMIT:
         context_text = context_text[:CONTEXT_CHAR_LIMIT]
-
     best_sim = float(sims.max()) if sims.size else 0.0
 
     if show_debug:
@@ -327,7 +339,7 @@ if st.button("Ask"):
                 st.markdown(f"**Chunk {i} (score: {float(sims[i-1]):.3f})**\n\n{c['text']}")
         st.stop()
 
-    # generate (stream)
+    # generate (stream; if that fails, sync fallback)
     if not GROQ_API_KEY:
         st.error("GROQ_API_KEY missing. Add it in Settings → Secrets.")
         st.stop()
@@ -336,17 +348,15 @@ if st.button("Ask"):
 
     st.markdown("### Answer")
     out_box = st.empty()
-    collected = []
-
-    # try streaming on the first model; if it errors fast, fall back to sync
     streamed = False
+    used_model = None
+
     for model in GROQ_MODELS:
         try:
             def _streamer():
                 nonlocal streamed
                 for tok in groq_stream(prompt, model, MAX_NEW_TOKENS):
                     streamed = True
-                    collected.append(tok)
                     yield tok
             st.write_stream(_streamer())
             used_model = model
@@ -355,10 +365,8 @@ if st.button("Ask"):
             continue
 
     if not streamed:
-        # sync fallback
         try:
             text, used_model = groq_generate_sync(prompt, MAX_NEW_TOKENS)
-            collected = [text]
             out_box.write(text)
         except Exception as e:
             st.error(f"Generation failed: {e}")
