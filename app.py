@@ -340,40 +340,40 @@ if st.button("Ask"):
         st.stop()
 
     # generate (stream; if that fails, sync fallback)
-    if not GROQ_API_KEY:
-        st.error("GROQ_API_KEY missing. Add it in Settings → Secrets.")
+if not GROQ_API_KEY:
+    st.error("GROQ_API_KEY missing. Add it in Settings → Secrets.")
+    st.stop()
+
+prompt = build_prompt(context_text, query)
+
+st.markdown("### Answer")
+used_model = None
+stream_success = False
+
+for model in GROQ_MODELS:
+    try:
+        def _streamer():
+            for tok in groq_stream(prompt, model, MAX_NEW_TOKENS):
+                yield tok
+
+        # Stream tokens to the UI; if it completes without raising, mark success
+        _ = st.write_stream(_streamer())
+        used_model = model
+        stream_success = True
+        break
+    except Exception:
+        continue
+
+if not stream_success:
+    try:
+        text, used_model = groq_generate_sync(prompt, MAX_NEW_TOKENS)
+        st.write(text)
+    except Exception as e:
+        st.error(f"Generation failed: {e}")
         st.stop()
 
-    prompt = build_prompt(context_text, query)
+st.caption(f"Groq model: {used_model}")
 
-    st.markdown("### Answer")
-    out_box = st.empty()
-    streamed = False
-    used_model = None
-
-    for model in GROQ_MODELS:
-        try:
-            def _streamer():
-                nonlocal streamed
-                for tok in groq_stream(prompt, model, MAX_NEW_TOKENS):
-                    streamed = True
-                    yield tok
-            st.write_stream(_streamer())
-            used_model = model
-            break
-        except Exception:
-            continue
-
-    if not streamed:
-        try:
-            text, used_model = groq_generate_sync(prompt, MAX_NEW_TOKENS)
-            out_box.write(text)
-        except Exception as e:
-            st.error(f"Generation failed: {e}")
-            st.stop()
-
-    st.caption(f"Groq model: {used_model}")
-
-    with st.expander("Show retrieved context"):
-        for i, c in enumerate(contexts, 1):
-            st.markdown(f"**Chunk {i} (score: {float(sims[i-1]):.3f})**\n\n{c['text']}")
+with st.expander("Show retrieved context"):
+    for i, c in enumerate(contexts, 1):
+        st.markdown(f"**Chunk {i} (score: {float(sims[i-1]):.3f})**\n\n{c['text']}")
