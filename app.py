@@ -1,3 +1,11 @@
+# --- sqlite patch for Chroma on Streamlit Cloud (must be first) ---
+try:
+    import sys, pysqlite3  # provided by pysqlite3-binary
+    sys.modules["sqlite3"] = pysqlite3
+except Exception:
+    pass
+# ------------------------------------------------------------------
+
 import os
 import time
 import streamlit as st
@@ -44,9 +52,10 @@ class HFEmbeddingFunction:
             texts = [texts]
         vectors = []
         for t in texts:
+            # feature_extraction may return a single vector or token-level vectors
             out = self.client.feature_extraction(t)
-            # If token-level, average pool
-            if isinstance(out, list) and len(out) > 0 and isinstance(out[0], list):
+            if isinstance(out, list) and out and isinstance(out[0], list):
+                # average pool token vectors
                 dim = len(out[0])
                 pooled = [0.0] * dim
                 for token_vec in out:
