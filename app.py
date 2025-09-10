@@ -106,7 +106,6 @@ def get_groq():
         raise RuntimeError("GROQ_API_KEY not set in Secrets.")
     return Groq(api_key=GROQ_API_KEY)
 
-# Keep one embedder around
 @st.cache_resource
 def get_embedder(model_id: str, token: str | None):
     return HFEmbedder(model_id, token)
@@ -295,7 +294,7 @@ if uploaded is not None:
         st.session_state.docs = []
         st.session_state.embeds = None
 
-    if st.session_state.embeds is None:
+    if st.session_state.embeds is None and st.session_state.uploaded_bytes:
         auto_index()
 
 query = st.text_input("Ask a question about the PDF")
@@ -340,40 +339,39 @@ if st.button("Ask"):
         st.stop()
 
     # generate (stream; if that fails, sync fallback)
-if not GROQ_API_KEY:
-    st.error("GROQ_API_KEY missing. Add it in Settings → Secrets.")
-    st.stop()
-
-prompt = build_prompt(context_text, query)
-
-st.markdown("### Answer")
-used_model = None
-stream_success = False
-
-for model in GROQ_MODELS:
-    try:
-        def _streamer():
-            for tok in groq_stream(prompt, model, MAX_NEW_TOKENS):
-                yield tok
-
-        # Stream tokens to the UI; if it completes without raising, mark success
-        _ = st.write_stream(_streamer())
-        used_model = model
-        stream_success = True
-        break
-    except Exception:
-        continue
-
-if not stream_success:
-    try:
-        text, used_model = groq_generate_sync(prompt, MAX_NEW_TOKENS)
-        st.write(text)
-    except Exception as e:
-        st.error(f"Generation failed: {e}")
+    if not GROQ_API_KEY:
+        st.error("GROQ_API_KEY missing. Add it in Settings → Secrets.")
         st.stop()
 
-st.caption(f"Groq model: {used_model}")
+    prompt = build_prompt(context_text, query)
 
-with st.expander("Show retrieved context"):
-    for i, c in enumerate(contexts, 1):
-        st.markdown(f"**Chunk {i} (score: {float(sims[i-1]):.3f})**\n\n{c['text']}")
+    st.markdown("### Answer")
+    used_model = None
+    stream_success = False
+
+    for model in GROQ_MODELS:
+        try:
+            def _streamer():
+                for tok in groq_stream(prompt, model, MAX_NEW_TOKENS):
+                    yield tok
+
+            _ = st.write_stream(_streamer())
+            used_model = model
+            stream_success = True
+            break
+        except Exception:
+            continue
+
+    if not stream_success:
+        try:
+            text, used_model = groq_generate_sync(prompt, MAX_NEW_TOKENS)
+            st.write(text)
+        except Exception as e:
+            st.error(f"Generation failed: {e}")
+            st.stop()
+
+    st.caption(f"Groq model: {used_model}")
+
+    with st.expander("Show retrieved context"):
+        for i, c in enumerate(contexts, 1):
+            st.markdown(f"**Chunk {i} (score: {float(sims[i-1]):.3f})**\n\n{c['text']}")
