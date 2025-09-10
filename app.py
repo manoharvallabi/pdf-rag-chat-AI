@@ -1,98 +1,228 @@
+import io
 import os
+import time
+import re
 import numpy as np
 import streamlit as st
 from pypdf import PdfReader
-from sentence_transformers import SentenceTransformer
-from transformers import pipeline
+from pdfminer.high_level import extract_text as pdfminer_extract_text
+from huggingface_hub import InferenceClient
+from groq import Groq
 
-# ----------------------------
+# =========================
 # Config
-# ----------------------------
-EMBED_MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2"   # ~80MB, good quality
-GEN_MODEL_ID   = "google/flan-t5-small"                     # ~300MB, CPU-friendly
+# =========================
+HF_TOKEN = os.environ.get("HF_TOKEN", "")            # set in Streamlit Secrets
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")    # set in Streamlit Secrets
+
+EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 TOP_K = 4
 MAX_NEW_TOKENS = 256
+LOW_CONFIDENCE = 0.08   # lower = answers more often
 
-# ----------------------------
-# Helpers
-# ----------------------------
-def chunk_text(text, chunk_size=900, overlap=150):
-    words = text.split()
-    chunks, start = [], 0
-    while start < len(words):
-        end = min(start + chunk_size, len(words))
-        chunk = " ".join(words[start:end])
-        if chunk.strip():
-            chunks.append(chunk)
-        if end == len(words):
-            break
-        start = max(0, end - overlap)
+GROQ_MODELS = [
+    "llama3-8b-8192",        # primary
+    "llama-3.1-8b-instant",  # fallback (if available)
+    "gemma2-9b-it",          # fallback
+]
+
+# =========================
+# Text utils
+# =========================
+def clean_text(s: str) -> str:
+    if not s:
+        return ""
+    s = re.sub(r"(\w)-\n(\w)", r"\1\2", s)      # join hyphenated line breaks
+    s = re.sub(r"[ \t]*\n[ \t]*", " ", s)       # join intra-paragraph newlines
+    s = re.sub(r"[ \t]{2,}", " ", s)            # collapse spaces
+    return s.strip()
+
+def split_paragraphs(text: str) -> list[str]:
+    paras = [clean_text(p) for p in re.split(r"\n\s*\n", text)]
+    return [p for p in paras if p]
+
+def merge_to_chunks(paras: list[str], target: int = 1000, overlap: int = 150) -> list[str]:
+    chunks, buf = [], []
+    cur = 0
+    for p in paras:
+        if cur + len(p) + 1 <= target or not buf:
+            buf.append(p); cur += len(p) + 1
+        else:
+            chunks.append(" ".join(buf))
+            carry, acc = [], 0
+            for para in reversed(buf):
+                carry.insert(0, para); acc += len(para) + 1
+                if acc >= overlap: break
+            buf = carry + [p]
+            cur = sum(len(x) + 1 for x in buf)
+    if buf: chunks.append(" ".join(buf))
     return chunks
 
-def pdf_to_text(file):
-    reader = PdfReader(file)
-    pages = []
-    for p in reader.pages:
-        try:
-            pages.append(p.extract_text() or "")
-        except Exception:
-            pages.append("")
-    return "\n\n".join(pages)
+def pdf_to_pages(file) -> list[str]:
+    """Try PyPDF; if little text, fall back to pdfminer."""
+    data = file.read()
 
-def t5_prompt(context, question):
+    # 1) PyPDF
+    pages = []
+    try:
+        reader = PdfReader(io.BytesIO(data))
+        for p in reader.pages:
+            try:
+                t = p.extract_text() or ""
+            except Exception:
+                t = ""
+            pages.append(clean_text(t))
+    except Exception:
+        pages = []
+
+    if sum(len(p or "") for p in pages) >= 500:
+        return pages
+
+    # 2) pdfminer (split on form-feed)
+    try:
+        text_all = pdfminer_extract_text(io.BytesIO(data)) or ""
+        pages_pm = [clean_text(x) for x in text_all.split("\f")]
+        if sum(len(p or "") for p in pages_pm) > sum(len(p or "") for p in pages):
+            return pages_pm
+    except Exception:
+        pass
+
+    return pages
+
+def build_prompt(context: str, question: str) -> str:
     return (
-        "Given the following context, answer the question concisely.\n\n"
+        "Answer strictly using the provided context. "
+        "If the answer is not in the context, reply with \"I don't know\".\n\n"
         f"Context:\n{context}\n\n"
         f"Question: {question}\n"
         "Answer:"
     )
 
-def normalize_rows(matrix):
-    norms = np.linalg.norm(matrix, axis=1, keepdims=True) + 1e-9
-    return matrix / norms
+# =========================
+# Embeddings (HF serverless)
+# =========================
+class HFEmbedder:
+    def __init__(self, model_id: str, token: str | None):
+        self.client = InferenceClient(model=model_id, token=token)
 
-# ----------------------------
-# Lazy-load models once
-# ----------------------------
-@st.cache_resource(show_spinner="Loading models… this happens only once")
-def load_models():
-    embedder = SentenceTransformer(EMBED_MODEL_ID, device="cpu")
-    # flan-t5-small text2text pipeline
-    generator = pipeline("text2text-generation", model=GEN_MODEL_ID, device=-1)
-    return embedder, generator
+    def encode(self, texts):
+        if isinstance(texts, str):
+            texts = [texts]
+        vecs = []
+        for t in texts:
+            for attempt in range(5):
+                try:
+                    out = self.client.feature_extraction(t)
+                    break
+                except Exception:
+                    time.sleep(1 + attempt * 0.5)
+            else:
+                out = []
+            # token-level -> mean pool
+            if isinstance(out, list) and out and isinstance(out[0], list):
+                arr = np.array(out, dtype=np.float32)  # (tokens, dim)
+                vec = arr.mean(axis=0)
+            else:
+                vec = np.array(out or [], dtype=np.float32)
+            vecs.append(vec)
+        return np.vstack(vecs) if vecs else np.zeros((0, 384), dtype=np.float32)
 
-embedder, generator = load_models()
+def normalize_rows(M: np.ndarray) -> np.ndarray:
+    n = np.linalg.norm(M, axis=1, keepdims=True) + 1e-9
+    return M / n
 
-# ----------------------------
+def cosine_topk(q: np.ndarray, M: np.ndarray, k: int):
+    if M.size == 0:
+        return np.array([], dtype=int), np.array([])
+    qn = q / (np.linalg.norm(q) + 1e-9)
+    Mn = normalize_rows(M)
+    sims = (Mn @ qn.reshape(-1, 1)).ravel()
+    k = min(k, len(sims))
+    idx = np.argpartition(-sims, k - 1)[:k]
+    idx = idx[np.argsort(-sims[idx])]
+    return idx, sims[idx]
+
+# =========================
+# Groq generation
+# =========================
+def groq_generate(prompt: str, max_tokens: int = MAX_NEW_TOKENS):
+    if not GROQ_API_KEY:
+        raise RuntimeError("GROQ_API_KEY not set in Secrets.")
+    client = Groq(api_key=GROQ_API_KEY)
+    last_err = None
+    for model in GROQ_MODELS:
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": "You are concise and only use the given context."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.2,
+                max_tokens=max_tokens,
+            )
+            return resp.choices[0].message.content.strip(), model
+        except Exception as e:
+            last_err = e
+            continue
+    raise RuntimeError(f"Groq generation failed: {last_err}")
+
+# =========================
 # App
-# ----------------------------
-st.set_page_config(page_title="PDF RAG (HF-only, local)", page_icon="📄")
-st.title("📄 Chat with your PDF — Hugging Face only (no APIs)")
+# =========================
+st.set_page_config(page_title="PDF RAG (HF embeddings + Groq)", page_icon="📄")
+st.title("📄 Chat with your PDF — HF embeddings + Groq generation")
 
+if not HF_TOKEN:
+    st.warning("Add HF_TOKEN in Streamlit Secrets to avoid rate limits.")
+if not GROQ_API_KEY:
+    st.warning("Add GROQ_API_KEY in Streamlit Secrets to enable answers.")
+
+# session state
 if "docs" not in st.session_state:
-    st.session_state.docs = []
+    st.session_state.docs = []         # list of {"text","page"}
 if "embeds" not in st.session_state:
-    st.session_state.embeds = None
-if "last_file_name" not in st.session_state:
-    st.session_state.last_file_name = None
+    st.session_state.embeds = None     # (N, d)
+if "last_file" not in st.session_state:
+    st.session_state.last_file = None
 
 uploaded = st.file_uploader("Upload a PDF", type=["pdf"])
+force_answer = st.checkbox("Answer even at low confidence", value=False)
+show_debug = st.checkbox("Show debug info", value=False)
 
-# Auto-index right after upload (or if a different file is uploaded)
+# auto-index after upload
 def auto_index():
     with st.spinner("Reading and indexing…"):
-        text = pdf_to_text(uploaded)
-        chunks = chunk_text(text)
-        # Sentence-Transformers encode -> numpy, normalized for cosine
-        vecs = embedder.encode(chunks, convert_to_numpy=True, show_progress_bar=False)
-        vecs = normalize_rows(vecs)
-        st.session_state.docs = chunks
+        pages = pdf_to_pages(uploaded)
+        pairs = []
+        for i, page_text in enumerate(pages, start=1):
+            if not page_text:
+                continue
+            paras = split_paragraphs(page_text)
+            chunks = merge_to_chunks(paras, 1000, 150)
+            for c in chunks:
+                if c.strip():
+                    pairs.append({"text": c, "page": i})
+
+        texts = [p["text"] for p in pairs]
+        if not texts:
+            st.warning("No extractable text found. If your PDF is scanned, OCR it first.")
+            st.session_state.docs, st.session_state.embeds = [], None
+            return
+
+        embedder = HFEmbedder(EMBED_MODEL, token=HF_TOKEN)
+        vecs = embedder.encode(texts)
+        if vecs.size == 0:
+            st.error("Embedding failed. Check HF_TOKEN or try again.")
+            return
+
+        st.session_state.docs = pairs
         st.session_state.embeds = vecs
-        st.session_state.last_file_name = uploaded.name
-        st.success(f"Indexed {len(chunks)} chunks.")
+        st.session_state.last_file = uploaded.name
+        st.success(f"Indexed {len(texts)} chunks across {len(pages)} pages.")
 
 if uploaded is not None:
-    if st.session_state.last_file_name != uploaded.name or st.session_state.embeds is None:
+    if st.session_state.last_file != uploaded.name or st.session_state.embeds is None:
         auto_index()
 
 query = st.text_input("Ask a question about the PDF")
@@ -101,25 +231,42 @@ if st.button("Ask"):
         st.error("Upload a PDF first.")
         st.stop()
 
-    # Retrieve
-    q = embedder.encode([query], convert_to_numpy=True, show_progress_bar=False)
-    q = q / (np.linalg.norm(q, axis=1, keepdims=True) + 1e-9)
-    sims = (st.session_state.embeds @ q.T).ravel()
-    if sims.size == 0:
+    # retrieve
+    embedder = HFEmbedder(EMBED_MODEL, token=HF_TOKEN)
+    qvec = embedder.encode(query)  # (1, d)
+    idx, sims = cosine_topk(qvec[0], st.session_state.embeds, TOP_K)
+    if len(idx) == 0:
         st.info("Couldn't retrieve relevant context. Try a different question.")
         st.stop()
 
-    topk_idx = np.argsort(-sims)[:TOP_K]
-    contexts = [st.session_state.docs[i] for i in topk_idx]
-    context_text = "\n\n---\n\n".join(contexts)
+    contexts = [st.session_state.docs[i] for i in idx]
+    context_text = "\n\n---\n\n".join(x["text"] for x in contexts)
+    best_sim = float(sims.max()) if sims.size else 0.0
 
-    # Generate
-    prompt = t5_prompt(context_text, query)
-    out = generator(prompt, max_new_tokens=MAX_NEW_TOKENS, do_sample=False)
-    answer = (out[0]["generated_text"] if isinstance(out, list) else str(out)).strip()
+    if show_debug:
+        st.write({"top_cosine_scores": [float(s) for s in sims], "best_cosine": best_sim, "chunks": len(st.session_state.docs)})
 
+    if not force_answer and (best_sim < LOW_CONFIDENCE or not context_text.strip()):
+        st.markdown("### Answer")
+        st.write("I don't know based on this document.")
+        with st.expander("Show retrieved context"):
+            for i, c in enumerate(contexts, 1):
+                st.markdown(f"**Chunk {i} (score: {float(sims[i-1]):.3f})**\n\n{c['text']}")
+        st.stop()
+
+    # generate
+    prompt = build_prompt(context_text, query)
+    try:
+        answer, used_model = groq_generate(prompt, MAX_NEW_TOKENS)
+    except Exception as e:
+        st.error(f"Generation failed: {e}")
+        st.stop()
+
+    # display
     st.markdown("### Answer")
     st.write(answer)
+    st.caption(f"Groq model: {used_model}")
+
     with st.expander("Show retrieved context"):
         for i, c in enumerate(contexts, 1):
-            st.markdown(f"**Chunk {i} (score: {float(sims[topk_idx[i-1]]):.3f})**\n\n{c}")
+            st.markdown(f"**Chunk {i} (score: {float(sims[i-1]):.3f})**\n\n{c['text']}")
