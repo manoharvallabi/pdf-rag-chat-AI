@@ -1,5 +1,8 @@
 import os
+import time
+import json
 import numpy as np
+import requests
 import streamlit as st
 from huggingface_hub import InferenceClient
 from pypdf import PdfReader
@@ -8,8 +11,8 @@ from pypdf import PdfReader
 # Config
 # ----------------------------
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
-EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-LLM_MODEL   = "google/flan-t5-base"   # works on HF serverless
+EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"   # embeddings via serverless
+LLM_MODEL   = "google/flan-t5-base"                      # works on HF serverless
 TOP_K = 4
 MAX_NEW_TOKENS = 256
 TEMPERATURE = 0.2
@@ -88,44 +91,38 @@ def cosine_topk(query_vec: np.ndarray, matrix: np.ndarray, k: int):
     idx = idx[np.argsort(-sims[idx])]
     return idx, sims[idx]
 
-def _unwrap(resp):
-    # HF can return str, dict, or list[dict]
-    if isinstance(resp, str):
-        return resp
-    if isinstance(resp, dict):
-        return resp.get("generated_text") or str(resp)
-    if isinstance(resp, list) and resp and isinstance(resp[0], dict):
-        return resp[0].get("generated_text") or str(resp[0])
-    return str(resp)
+# ----------------------------
+# Serverless generation via HTTP
+# ----------------------------
+def hf_generate_http(model_id: str, prompt: str, max_new_tokens: int = MAX_NEW_TOKENS):
+    """
+    Call Hugging Face serverless inference endpoint directly.
+    Works for both text-generation and text2text-generation models.
+    Handles 503 "loading" responses with a short retry.
+    """
+    url = f"https://api-inference.huggingface.co/models/{model_id}"
+    headers = {"Authorization": f"Bearer {HF_TOKEN}"}
+    payload = {"inputs": prompt, "parameters": {"max_new_tokens": max_new_tokens}}
 
-def generate_answer(client: InferenceClient, model_id: str, prompt: str):
-    m = model_id.lower()
-    # Prefer the text2text path for FLAN/T5/MT0/BART
-    if any(t in m for t in ("t5", "flan", "mt0", "bart", "mbart")):
-        try:
-            # Some hub versions expose this:
-            return client.text2text_generation(prompt, max_new_tokens=MAX_NEW_TOKENS)
-        except Exception:
-            # Generic call to the correct task
-            resp = client.post(
-                json={"inputs": prompt, "parameters": {"max_new_tokens": MAX_NEW_TOKENS}},
-                task="text2text-generation",
-            )
-            return _unwrap(resp)
-    # Fallback: causal LM path
-    try:
-        return client.text_generation(
-            prompt,
-            max_new_tokens=MAX_NEW_TOKENS,
-            temperature=TEMPERATURE,
-            do_sample=False,
-        )
-    except Exception:
-        resp = client.post(
-            json={"inputs": prompt, "parameters": {"max_new_tokens": MAX_NEW_TOKENS, "temperature": TEMPERATURE, "do_sample": False}},
-            task="text-generation",
-        )
-        return _unwrap(resp)
+    for attempt in range(5):
+        r = requests.post(url, headers=headers, json=payload, timeout=120)
+        # If model is loading, HF returns 503 + estimated_time
+        if r.status_code == 503:
+            try:
+                wait = r.json().get("estimated_time", 5)
+            except Exception:
+                wait = 5
+            time.sleep(min(20, wait + 1))
+            continue
+        r.raise_for_status()
+        out = r.json()
+        # Normalize response
+        if isinstance(out, list) and out and isinstance(out[0], dict):
+            return out[0].get("generated_text") or out[0].get("translation_text") or str(out[0])
+        if isinstance(out, dict):
+            return out.get("generated_text") or out.get("answer") or str(out)
+        return str(out)
+    raise RuntimeError("HF serverless generation retry limit exceeded")
 
 # ----------------------------
 # App
@@ -182,9 +179,8 @@ if go:
         st.info("Couldn't retrieve relevant context. Try a different question.")
     else:
         prompt = build_prompt(context_text, query)
-        client = InferenceClient(model=llm_model_id, token=HF_TOKEN)
         try:
-            answer = generate_answer(client, llm_model_id, prompt)
+            answer = hf_generate_http(llm_model_id, prompt, MAX_NEW_TOKENS)
         except Exception as e:
             st.error(f"Generation failed: {e}")
             st.stop()
