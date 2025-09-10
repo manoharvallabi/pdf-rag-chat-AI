@@ -1,7 +1,6 @@
 streamlit
 pypdf
 numpy
-requests
 huggingface_hub>=0.34.0
 groq
 pdfminer.six==20240706
