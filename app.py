@@ -28,89 +28,10 @@ MAX_NEW_TOKENS_DEF = 192
 LOW_CONFIDENCE     = 0.02
 
 # =========================
-# Minimal UI styling
+# Default UI (clean)
 # =========================
-st.set_page_config(page_title="Chat with your PDF", page_icon="📄", layout="centered")
-
-st.markdown("""
-<style>
-/* Hide Streamlit’s core chrome */
-#MainMenu, header {visibility: hidden;}
-footer {visibility: hidden;}
-
-:root {
-  --bg: #0b0b0c;
-  --panel: #111114;
-  --text: #e8e8ea;
-  --muted: #a9a9ae;
-  --brand: #007aff; /* iOS blue */
-  --border: #2a2a2f;
-}
-
-html, body, [data-testid="stAppViewContainer"] {
-  background: var(--bg);
-  color: var(--text);
-}
-
-/* Center column, narrow measure */
-.block-container {
-  max-width: 880px !important;
-  padding-top: 2rem;
-  padding-bottom: 3rem;
-}
-
-/* Title area */
-h1, h2, h3 { letter-spacing: -0.02em; }
-
-/* Cards / panels */
-.st-emotion-cache-1r6slb0, .st-emotion-cache-16idsys, .stFileUploader {
-  background: var(--panel) !important;
-  border: 1px solid var(--border) !important;
-  border-radius: 16px !important;
-  padding: 16px !important;
-}
-
-/* Inputs */
-input[type="text"], textarea, .stTextInput > div > div > input {
-  background: #0e0e12 !important;
-  color: var(--text) !important;
-  border: 1px solid var(--border) !important;
-  border-radius: 12px !important;
-}
-
-/* Buttons */
-button[kind="primary"], .stButton > button {
-  background: var(--brand) !important;
-  color: white !important;
-  border-radius: 12px !important;
-  border: none !important;
-  padding: 0.65rem 1rem !important;
-}
-button[disabled]{ opacity:.45 !important; }
-
-/* Sidebar */
-section[data-testid="stSidebar"] {
-  background: #0f0f13 !important;
-  border-right: 1px solid var(--border) !important;
-}
-section[data-testid="stSidebar"] .stCheckbox, section[data-testid="stSidebar"] .stToggle {
-  color: var(--text) !important;
-}
-
-/* Subtle separators */
-hr {
-  border: none;
-  border-top: 1px solid var(--border);
-  margin: 1.2rem 0;
-}
-
-/* Captions */
-.small-muted {
-  color: var(--muted);
-  font-size: 0.9rem;
-}
-</style>
-""", unsafe_allow_html=True)
+st.set_page_config(page_title="Chat with your PDF", page_icon="📄")
+st.title("📄 Chat with your PDF")
 
 # =========================
 # Helpers
@@ -153,7 +74,7 @@ def pdf_to_pages(data: bytes) -> list[str]:
             pages.append(clean_text(t))
     except Exception:
         pages = []
-    if sum(len(p) for p in pages) >= 500:  # enough text
+    if sum(len(p) for p in pages) >= 500:
         return pages
     try:
         all_text = pdfminer_extract_text(io.BytesIO(data)) or ""
@@ -168,7 +89,7 @@ def build_prompt(context: str, question: str, strict: bool) -> str:
     if strict:
         rules = "Answer strictly using the provided context. If the answer is not in the context, reply with \"I don't know\"."
     else:
-        rules = "Use the provided context primarily. If details are missing, answer helpfully and indicate if the document lacks specifics."
+        rules = "Use the provided context primarily. If details are missing, answer helpfully."
     return f"{rules}\n\nContext:\n{context}\n\nQuestion: {question}\nAnswer:"
 
 # =========================
@@ -391,22 +312,15 @@ if uploaded is not None and st.session_state.last_file != uploaded.name:
     auto_index()
 
 # File card
-st.title("Chat with your PDF")
 if st.session_state.meta:
     m = st.session_state.meta
-    st.markdown(f"<div class='small-muted'>Loaded: <b>{m.get('filename','?')}</b> • Pages: {m.get('pages','?')} • Chunks: {m.get('chunks','?')}</div>", unsafe_allow_html=True)
-
-st.markdown("<hr/>", unsafe_allow_html=True)
+    st.caption(f"Loaded: {m.get('filename','?')} • Pages: {m.get('pages','?')} • Chunks: {m.get('chunks','?')}")
 
 # =========================
 # Ask form (minimal)
 # =========================
 with st.form("qa", clear_on_submit=False):
-    query = st.text_input(
-        "Ask a question",
-        value="",
-        placeholder="e.g., Summarize in 3 sentences, list key skills, timelines, who/what/where…",
-    )
+    query = st.text_input("Ask a question", value="", placeholder="e.g., Summarize, list key skills, timelines…")
     ready = st.session_state.embeds is not None and len(st.session_state.docs) > 0
     submitted = st.form_submit_button("Ask", use_container_width=True, disabled=not ready)
 
@@ -450,14 +364,8 @@ if submitted:
         st.stop()
 
     context_text = "\n\n---\n\n".join(x["text"] for x in contexts)
-    if len(context_text) > (3500 if st.sidebar.checkbox.__doc__ else 9000):  # keeps mypy quiet
-        pass  # already controlled by CONTEXT_CHAR_LIMIT below
     if len(context_text) > CONTEXT_CHAR_LIMIT:
         context_text = context_text[:CONTEXT_CHAR_LIMIT]
-
-    meta = st.session_state.meta or {}
-    meta_line = f"[File: {meta.get('filename','unknown.pdf')}; Pages: {meta.get('pages','?')}]"
-    context_text = meta_line + "\n\n" + context_text
 
     if show_debug:
         st.write({"best_cosine": best_sim, "top_k": TOP_K, "max_new_tokens": MAX_NEW_TOKENS, "chunks": len(st.session_state.docs)})
@@ -502,10 +410,8 @@ if submitted:
     st.caption(f"Model: {GROQ_MODEL} • Embeddings: {EMBED_BACKEND}")
     st.session_state.turn += 1
 
-# Bottom actions (tiny)
-col_clear, _ = st.columns([1, 6])
-with col_clear:
-    if st.button("Clear session"):
-        for k in list(st.session_state.keys()):
-            del st.session_state[k]
-        st.rerun()
+# Clear session button
+if st.button("Clear session"):
+    for k in list(st.session_state.keys()):
+        del st.session_state[k]
+    st.rerun()
