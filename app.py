@@ -30,7 +30,7 @@ LOW_CONFIDENCE     = 0.02
 # =========================
 # Default UI
 # =========================
-st.set_page_config(page_title="Chat with your PDFs", page_icon="📄")
+st.set_page_config(page_title="Chat with your PDFs", page_icon="🔎")
 st.title("Chat with your PDFs")
 
 # =========================
@@ -320,6 +320,14 @@ with st.form("qa", clear_on_submit=False):
 if submitted:
     msg = (query or "").strip().lower()
 
+    # Special question: how many documents
+    if "how many" in msg and "document" in msg:
+        count = len(st.session_state.docs_all)
+        answer = f"You currently have {count} PDF document{'s' if count!=1 else ''} uploaded."
+        st.session_state.chat_history.append({"user": query, "answer": answer})
+        st.rerun()
+
+    # Greeting rule
     if msg == "hi":
         answer = "Hi, happy to hep, start your questions" if len(st.session_state.chat_history)==0 else "please continue"
         st.session_state.chat_history.append({"user": query, "answer": answer})
@@ -371,13 +379,9 @@ if submitted:
     st.rerun()
 
 # =========================
-# Clear buttons
+# Clear chat button only if history exists
 # =========================
-col1, col2 = st.columns(2)
-if col1.button("Clear chat"):
-    st.session_state.chat_history = []
-    st.rerun()
-if col2.button("Clear all"):
-    st.session_state.chat_history = []
-    st.session_state.docs_all = []
-    st.rerun()
+if len(st.session_state.chat_history) > 0:
+    if st.button("Clear chat"):
+        st.session_state.chat_history = []
+        st.rerun()
