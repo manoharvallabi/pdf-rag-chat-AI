@@ -15,14 +15,15 @@ from groq import Groq
 HF_TOKEN = os.environ.get("HF_TOKEN", "")            # set in Streamlit Secrets
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")    # set in Streamlit Secrets
 
-EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"   # serverless embeddings
+DEFAULT_EMBED_DIM = 384  # all-MiniLM-L6-v2 outputs 384-d vectors
 TOP_K = 4
 MAX_NEW_TOKENS = 256
-LOW_CONFIDENCE = 0.08   # lower = answers more often
+LOW_CONFIDENCE = 0.08  # lower -> willing to answer more often
 
 GROQ_MODELS = [
     "llama3-8b-8192",        # primary
-    "llama-3.1-8b-instant",  # fallback (if available)
+    "llama-3.1-8b-instant",  # fallback (if enabled in your account)
     "gemma2-9b-it",          # fallback
 ]
 
@@ -32,9 +33,9 @@ GROQ_MODELS = [
 def clean_text(s: str) -> str:
     if not s:
         return ""
-    s = re.sub(r"(\w)-\n(\w)", r"\1\2", s)      # join hyphenated line breaks
-    s = re.sub(r"[ \t]*\n[ \t]*", " ", s)       # join intra-paragraph newlines
-    s = re.sub(r"[ \t]{2,}", " ", s)            # collapse spaces
+    s = re.sub(r"(\w)-\n(\w)", r"\1\2", s)   # join hyphenated line breaks
+    s = re.sub(r"[ \t]*\n[ \t]*", " ", s)    # join intra-paragraph newlines
+    s = re.sub(r"[ \t]{2,}", " ", s)         # collapse spaces
     return s.strip()
 
 def split_paragraphs(text: str) -> list[str]:
@@ -49,6 +50,7 @@ def merge_to_chunks(paras: list[str], target: int = 1000, overlap: int = 150) ->
             buf.append(p); cur += len(p) + 1
         else:
             chunks.append(" ".join(buf))
+            # overlap by reusing last ~overlap chars
             carry, acc = [], 0
             for para in reversed(buf):
                 carry.insert(0, para); acc += len(para) + 1
@@ -102,37 +104,55 @@ def build_prompt(context: str, question: str) -> str:
 # Embeddings (HF serverless)
 # =========================
 class HFEmbedder:
-    def __init__(self, model_id: str, token: str | None):
+    def __init__(self, model_id: str, token: str | None, default_dim: int = DEFAULT_EMBED_DIM):
         self.client = InferenceClient(model=model_id, token=token)
+        self.default_dim = default_dim
+        self._dim = None  # learn on first non-empty vector
+
+    def _pool(self, out):
+        # out may be: [float,...] or [[float,...], ...]
+        if isinstance(out, list) and out:
+            if isinstance(out[0], list):  # token-level -> mean pool
+                arr = np.asarray(out, dtype=np.float32)
+                vec = arr.mean(axis=0)
+                return vec
+            else:
+                return np.asarray(out, dtype=np.float32)
+        return np.asarray([], dtype=np.float32)
+
+    def encode_one(self, text: str, retries: int = 4, backoff: float = 0.8) -> np.ndarray:
+        last_err = None
+        for i in range(retries):
+            try:
+                out = self.client.feature_extraction(text)
+                vec = self._pool(out)
+                if vec.size:
+                    if self._dim is None:
+                        self._dim = int(vec.shape[-1])
+                    return vec.astype(np.float32)
+            except Exception as e:
+                last_err = e
+            time.sleep(backoff * (i + 1))
+        # give a safe zero vector with known dim
+        dim = self._dim or self.default_dim
+        return np.zeros((dim,), dtype=np.float32)
 
     def encode(self, texts):
         if isinstance(texts, str):
             texts = [texts]
-        vecs = []
-        for t in texts:
-            for attempt in range(5):
-                try:
-                    out = self.client.feature_extraction(t)
-                    break
-                except Exception:
-                    time.sleep(1 + attempt * 0.5)
-            else:
-                out = []
-            # token-level -> mean pool
-            if isinstance(out, list) and out and isinstance(out[0], list):
-                arr = np.array(out, dtype=np.float32)  # (tokens, dim)
-                vec = arr.mean(axis=0)
-            else:
-                vec = np.array(out or [], dtype=np.float32)
-            vecs.append(vec)
-        return np.vstack(vecs) if vecs else np.zeros((0, 384), dtype=np.float32)
+        vecs = [self.encode_one(t) for t in texts]
+        # If any vector ended up zero-length (shouldn't), fix shape.
+        vecs = [v if v.size else np.zeros((self._dim or self.default_dim,), dtype=np.float32) for v in vecs]
+        return np.vstack(vecs)
 
 def normalize_rows(M: np.ndarray) -> np.ndarray:
+    if M.size == 0:
+        return M
     n = np.linalg.norm(M, axis=1, keepdims=True) + 1e-9
     return M / n
 
 def cosine_topk(q: np.ndarray, M: np.ndarray, k: int):
-    if M.size == 0:
+    if M.size == 0 or q.size == 0:
         return np.array([], dtype=int), np.array([])
     qn = q / (np.linalg.norm(q) + 1e-9)
     Mn = normalize_rows(M)
@@ -174,9 +194,9 @@ st.set_page_config(page_title="PDF RAG (HF embeddings + Groq)", page_icon="📄"
 st.title("📄 Chat with your PDF — HF embeddings + Groq generation")
 
 if not HF_TOKEN:
-    st.warning("Add HF_TOKEN in Streamlit Secrets to avoid rate limits.")
+    st.info("Tip: add HF_TOKEN in Secrets to avoid HF rate limits.")
 if not GROQ_API_KEY:
-    st.warning("Add GROQ_API_KEY in Streamlit Secrets to enable answers.")
+    st.warning("Add GROQ_API_KEY in Secrets to enable answers.")
 
 # session state
 if "docs" not in st.session_state:
@@ -211,8 +231,8 @@ def auto_index():
             return
 
         embedder = HFEmbedder(EMBED_MODEL, token=HF_TOKEN)
-        vecs = embedder.encode(texts)
-        if vecs.size == 0:
+        vecs = embedder.encode(texts)  # (N, d)
+        if vecs.size == 0 or vecs.ndim != 2:
             st.error("Embedding failed. Check HF_TOKEN or try again.")
             return
 
@@ -234,6 +254,10 @@ if st.button("Ask"):
     # retrieve
     embedder = HFEmbedder(EMBED_MODEL, token=HF_TOKEN)
     qvec = embedder.encode(query)  # (1, d)
+    if qvec.size == 0:
+        st.error("Query embedding failed. Try again.")
+        st.stop()
+
     idx, sims = cosine_topk(qvec[0], st.session_state.embeds, TOP_K)
     if len(idx) == 0:
         st.info("Couldn't retrieve relevant context. Try a different question.")
@@ -244,7 +268,11 @@ if st.button("Ask"):
     best_sim = float(sims.max()) if sims.size else 0.0
 
     if show_debug:
-        st.write({"top_cosine_scores": [float(s) for s in sims], "best_cosine": best_sim, "chunks": len(st.session_state.docs)})
+        st.write({
+            "top_cosine_scores": [float(s) for s in sims],
+            "best_cosine": best_sim,
+            "chunks": len(st.session_state.docs),
+        })
 
     if not force_answer and (best_sim < LOW_CONFIDENCE or not context_text.strip()):
         st.markdown("### Answer")
@@ -255,6 +283,10 @@ if st.button("Ask"):
         st.stop()
 
     # generate
+    if not GROQ_API_KEY:
+        st.error("GROQ_API_KEY missing. Add it in Settings → Secrets.")
+        st.stop()
+
     prompt = build_prompt(context_text, query)
     try:
         answer, used_model = groq_generate(prompt, MAX_NEW_TOKENS)
