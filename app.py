@@ -11,32 +11,115 @@ from rank_bm25 import BM25Okapi
 from huggingface_hub import InferenceClient
 from groq import Groq
 
-# ----------------------------
+# =========================
 # Config (env overrides)
-# ----------------------------
+# =========================
 GROQ_API_KEY   = os.getenv("GROQ_API_KEY", "")
-GROQ_MODEL     = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")  # active Groq model
+GROQ_MODEL     = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 EMBED_BACKEND  = os.getenv("EMBEDDING_BACKEND", "LOCAL").upper()  # LOCAL | OPENAI | HF
 
-HF_TOKEN       = os.getenv("HF_TOKEN", "")      # used if EMBEDDING_BACKEND=HF
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")# used if EMBEDDING_BACKEND=OPENAI
+HF_TOKEN       = os.getenv("HF_TOKEN", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
-EMBED_MODEL_HF = "sentence-transformers/all-MiniLM-L6-v2"
-DEFAULT_EMBED_DIM = 384
+EMBED_MODEL_HF     = "sentence-transformers/all-MiniLM-L6-v2"
+DEFAULT_EMBED_DIM  = 384
+TOP_K_DEFAULT      = 3
+MAX_NEW_TOKENS_DEF = 192
+LOW_CONFIDENCE     = 0.02
 
-TOP_K_DEFAULT = 3
-MAX_NEW_TOKENS_DEFAULT = 192
-LOW_CONFIDENCE = 0.02     # more forgiving for normal users
+# =========================
+# Minimal UI styling
+# =========================
+st.set_page_config(page_title="Chat with your PDF", page_icon="📄", layout="centered")
 
-# ----------------------------
-# Small text helpers
-# ----------------------------
+st.markdown("""
+<style>
+/* Hide Streamlit’s core chrome */
+#MainMenu, header {visibility: hidden;}
+footer {visibility: hidden;}
+
+:root {
+  --bg: #0b0b0c;
+  --panel: #111114;
+  --text: #e8e8ea;
+  --muted: #a9a9ae;
+  --brand: #007aff; /* iOS blue */
+  --border: #2a2a2f;
+}
+
+html, body, [data-testid="stAppViewContainer"] {
+  background: var(--bg);
+  color: var(--text);
+}
+
+/* Center column, narrow measure */
+.block-container {
+  max-width: 880px !important;
+  padding-top: 2rem;
+  padding-bottom: 3rem;
+}
+
+/* Title area */
+h1, h2, h3 { letter-spacing: -0.02em; }
+
+/* Cards / panels */
+.st-emotion-cache-1r6slb0, .st-emotion-cache-16idsys, .stFileUploader {
+  background: var(--panel) !important;
+  border: 1px solid var(--border) !important;
+  border-radius: 16px !important;
+  padding: 16px !important;
+}
+
+/* Inputs */
+input[type="text"], textarea, .stTextInput > div > div > input {
+  background: #0e0e12 !important;
+  color: var(--text) !important;
+  border: 1px solid var(--border) !important;
+  border-radius: 12px !important;
+}
+
+/* Buttons */
+button[kind="primary"], .stButton > button {
+  background: var(--brand) !important;
+  color: white !important;
+  border-radius: 12px !important;
+  border: none !important;
+  padding: 0.65rem 1rem !important;
+}
+button[disabled]{ opacity:.45 !important; }
+
+/* Sidebar */
+section[data-testid="stSidebar"] {
+  background: #0f0f13 !important;
+  border-right: 1px solid var(--border) !important;
+}
+section[data-testid="stSidebar"] .stCheckbox, section[data-testid="stSidebar"] .stToggle {
+  color: var(--text) !important;
+}
+
+/* Subtle separators */
+hr {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 1.2rem 0;
+}
+
+/* Captions */
+.small-muted {
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+</style>
+""", unsafe_allow_html=True)
+
+# =========================
+# Helpers
+# =========================
 def clean_text(s: str) -> str:
-    if not s:
-        return ""
-    s = re.sub(r"(\w)-\n(\w)", r"\1\2", s)   # fix hyphenation
-    s = re.sub(r"[ \t]*\n[ \t]*", " ", s)    # collapse newlines
-    s = re.sub(r"[ \t]{2,}", " ", s)         # collapse spaces
+    if not s: return ""
+    s = re.sub(r"(\w)-\n(\w)", r"\1\2", s)
+    s = re.sub(r"[ \t]*\n[ \t]*", " ", s)
+    s = re.sub(r"[ \t]{2,}", " ", s)
     return s.strip()
 
 def split_paragraphs(text: str) -> list[str]:
@@ -59,7 +142,6 @@ def merge_to_chunks(paras: list[str], target: int = 1100, overlap: int = 160) ->
     return chunks
 
 def pdf_to_pages(data: bytes) -> list[str]:
-    """Try PyPDF per-page; if thin text, fall back to pdfminer (split on form-feed)."""
     pages = []
     try:
         reader = PdfReader(io.BytesIO(data))
@@ -71,10 +153,8 @@ def pdf_to_pages(data: bytes) -> list[str]:
             pages.append(clean_text(t))
     except Exception:
         pages = []
-
-    if sum(len(p) for p in pages) >= 500:
+    if sum(len(p) for p in pages) >= 500:  # enough text
         return pages
-
     try:
         all_text = pdfminer_extract_text(io.BytesIO(data)) or ""
         pages_pm = [clean_text(x) for x in all_text.split("\f")]
@@ -88,17 +168,12 @@ def build_prompt(context: str, question: str, strict: bool) -> str:
     if strict:
         rules = "Answer strictly using the provided context. If the answer is not in the context, reply with \"I don't know\"."
     else:
-        rules = "Use the provided context primarily. If details are missing, answer helpfully but avoid fabricating specifics; say when the document lacks information."
-    return (
-        f"{rules}\n\n"
-        f"Context:\n{context}\n\n"
-        f"Question: {question}\n"
-        "Answer:"
-    )
+        rules = "Use the provided context primarily. If details are missing, answer helpfully and indicate if the document lacks specifics."
+    return f"{rules}\n\nContext:\n{context}\n\nQuestion: {question}\nAnswer:"
 
-# ----------------------------
+# =========================
 # Clients (cached)
-# ----------------------------
+# =========================
 @st.cache_resource
 def groq_client():
     if not GROQ_API_KEY:
@@ -109,10 +184,8 @@ def groq_client():
 def hf_client(model_id: str, token: str | None):
     return InferenceClient(model=model_id, token=token)
 
-# Optional imports cached lazily to avoid heavy imports when not needed
 @st.cache_resource
 def local_st_model():
-    # Local sentence-transformers (fast after first load)
     from sentence_transformers import SentenceTransformer
     return SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 
@@ -123,14 +196,13 @@ def openai_client():
         raise RuntimeError("OPENAI_API_KEY not set")
     return OpenAI(api_key=OPENAI_API_KEY)
 
-# ----------------------------
-# Embeddings backends
-# ----------------------------
+# =========================
+# Embeddings
+# =========================
 class Embedder:
     def __init__(self, backend: str):
         self.backend = backend
         self.dim = None
-
         if backend == "LOCAL":
             self.model = local_st_model()
             self.dim = 384
@@ -142,32 +214,24 @@ class Embedder:
             raise ValueError("EMBEDDING_BACKEND must be LOCAL, OPENAI, or HF")
 
     def encode(self, texts):
-        if isinstance(texts, str):
-            texts = [texts]
-
+        if isinstance(texts, str): texts = [texts]
         if self.backend == "LOCAL":
             vecs = self.model.encode(texts, normalize_embeddings=False)
             arr = np.asarray(vecs, dtype=np.float32)
             self.dim = arr.shape[-1]
             return arr
-
         if self.backend == "OPENAI":
             out = self.cli.embeddings.create(model="text-embedding-3-small", input=texts)
             vecs = [np.array(d.embedding, dtype=np.float32) for d in out.data]
-            arr = np.vstack(vecs)
-            self.dim = arr.shape[-1]
+            arr = np.vstack(vecs); self.dim = arr.shape[-1]
             return arr
-
         if self.backend == "HF":
-            # HF serverless sometimes returns token vectors (list[list[float]]).
             def _pool(o):
                 if isinstance(o, list) and o:
                     if isinstance(o[0], list):
-                        a = np.asarray(o, dtype=np.float32)
-                        return a.mean(axis=0)
+                        a = np.asarray(o, dtype=np.float32); return a.mean(axis=0)
                     return np.asarray(o, dtype=np.float32)
                 return np.asarray([], dtype=np.float32)
-
             vecs = []
             for t in texts:
                 last = None
@@ -176,17 +240,15 @@ class Embedder:
                         out = self.cli.feature_extraction(t)
                         v = _pool(out)
                         if v.size:
-                            vecs.append(v.astype(np.float32))
-                            break
+                            vecs.append(v.astype(np.float32)); break
                     except Exception as e:
                         last = e
-                    time.sleep(0.5 * (i + 1))
+                    time.sleep(0.5*(i+1))
                 else:
                     dim = self.dim or DEFAULT_EMBED_DIM
                     vecs.append(np.zeros((dim,), dtype=np.float32))
                 if not self.dim and vecs and vecs[-1].size:
                     self.dim = int(vecs[-1].shape[-1])
-            # pad if shapes differ
             dim = self.dim or DEFAULT_EMBED_DIM
             vecs = [v if v.size else np.zeros((dim,), dtype=np.float32) for v in vecs]
             return np.vstack(vecs)
@@ -210,16 +272,15 @@ def bm25_topk(query: str, docs: list[str], k: int):
     bm25 = BM25Okapi(tokenized)
     scores = bm25.get_scores(query.lower().split())
     scores = np.asarray(scores, dtype=np.float32) if len(scores) else np.array([], dtype=np.float32)
-    if scores.size == 0:
-        return np.array([], dtype=int), np.array([])
+    if scores.size == 0: return np.array([], dtype=int), np.array([])
     k = min(k, scores.size)
     idx = np.argpartition(-scores, k - 1)[:k]
     idx = idx[np.argsort(-scores[idx])]
     return idx, scores[idx]
 
-# ----------------------------
+# =========================
 # Groq generation
-# ----------------------------
+# =========================
 def groq_stream(prompt: str, max_tokens: int):
     cli = groq_client()
     resp = cli.chat.completions.create(
@@ -237,8 +298,7 @@ def groq_stream(prompt: str, max_tokens: int):
             ch = chunk.choices[0]
             delta = getattr(ch, "delta", None)
             content = getattr(delta, "content", None) if delta else None
-            if content:
-                yield content
+            if content: yield content
         except Exception:
             continue
 
@@ -255,32 +315,25 @@ def groq_generate_sync(prompt: str, max_tokens: int) -> str:
     )
     return resp.choices[0].message.content.strip()
 
-# ----------------------------
-# App UI
-# ----------------------------
-st.set_page_config(page_title="Chat with your PDF", page_icon="📄")
-st.title("📄 Chat with your PDF")
-
+# =========================
+# Sidebar (slim)
+# =========================
 with st.sidebar:
     st.subheader("Settings")
     strict_rag   = st.toggle("Strict RAG (only from doc)", value=False)
-    fast_mode    = st.checkbox("Fast mode", value=True, help="Smaller context for speed.")
+    fast_mode    = st.checkbox("Fast mode", value=True)
     long_answers = st.checkbox("Long answers", value=False)
     force_answer = st.checkbox("Answer at low confidence", value=True)
     show_debug   = st.checkbox("Show debug info", value=False)
-
-    st.caption(f"Model: `{GROQ_MODEL}`  •  Embeddings: `{EMBED_BACKEND}`")
-    if not GROQ_API_KEY: st.warning("Add GROQ_API_KEY in Secrets.")
-    if EMBED_BACKEND == "HF" and not HF_TOKEN:
-        st.info("Tip: add HF_TOKEN to avoid cold starts.")
-    if EMBED_BACKEND == "OPENAI" and not OPENAI_API_KEY:
-        st.warning("OPENAI_API_KEY not set (embeddings).")
+    st.caption(f"Model: {GROQ_MODEL} • Embeddings: {EMBED_BACKEND}")
 
 TOP_K = 2 if fast_mode else TOP_K_DEFAULT
-MAX_NEW_TOKENS = 320 if long_answers else MAX_NEW_TOKENS_DEFAULT
+MAX_NEW_TOKENS = 320 if long_answers else MAX_NEW_TOKENS_DEF
 CONTEXT_CHAR_LIMIT = 3500 if fast_mode else 9000
 
+# =========================
 # Session
+# =========================
 for key, default in [
     ("docs", []), ("embeds", None), ("last_file", None),
     ("uploaded_bytes", None), ("meta", {}), ("turn", 0)
@@ -338,40 +391,31 @@ if uploaded is not None and st.session_state.last_file != uploaded.name:
     auto_index()
 
 # File card
+st.title("Chat with your PDF")
 if st.session_state.meta:
     m = st.session_state.meta
-    st.info(f"**Loaded:** {m.get('filename','?')}  •  Pages: {m.get('pages','?')}  •  Chunks: {m.get('chunks','?')}")
+    st.markdown(f"<div class='small-muted'>Loaded: <b>{m.get('filename','?')}</b> • Pages: {m.get('pages','?')} • Chunks: {m.get('chunks','?')}</div>", unsafe_allow_html=True)
 
-# Example chips
-if st.session_state.embeds is not None and st.session_state.docs:
-    c1, c2, c3 = st.columns(3)
-    if c1.button("Summarize", use_container_width=True):
-        st.session_state.prefill = "Summarize this document in 3 sentences."
-        st.rerun()
-    if c2.button("Key details", use_container_width=True):
-        st.session_state.prefill = "List the key facts and numbers mentioned."
-        st.rerun()
-    if c3.button("Document name?", use_container_width=True):
-        st.session_state.prefill = "What is the document name?"
-        st.rerun()
+st.markdown("<hr/>", unsafe_allow_html=True)
 
-# Ask form
+# =========================
+# Ask form (minimal)
+# =========================
 with st.form("qa", clear_on_submit=False):
     query = st.text_input(
-        "Ask a question about the PDF",
-        value=st.session_state.get("prefill", ""),
-        placeholder="Try: Summarize this document in 3 sentences",
+        "Ask a question",
+        value="",
+        placeholder="e.g., Summarize in 3 sentences, list key skills, timelines, who/what/where…",
     )
-    st.session_state.prefill = ""
     ready = st.session_state.embeds is not None and len(st.session_state.docs) > 0
     submitted = st.form_submit_button("Ask", use_container_width=True, disabled=not ready)
 
 if submitted:
     msg = (query or "").strip().lower()
 
-    # Greeting behavior
+    # Greeting rule
     if msg == "hi":
-        st.markdown("### Answer")
+        st.subheader("Answer")
         if st.session_state.turn == 0:
             st.write("Hi, happy to hep, start your questions")
         else:
@@ -383,9 +427,9 @@ if submitted:
         st.error("Upload and index a PDF first.")
         st.stop()
 
-    # -------- Retrieval (dense + BM25 fallback) --------
+    # Retrieve (dense + BM25)
     emb = get_embedder()
-    qvec = emb.encode(query)  # (1, d)
+    qvec = emb.encode(query)
     if qvec.size == 0:
         st.error("Query embedding failed. Try again.")
         st.stop()
@@ -399,14 +443,15 @@ if submitted:
         bm_idx, bm_scores = bm25_topk(query, all_texts, TOP_K)
         if len(bm_idx):
             contexts = [st.session_state.docs[i] for i in bm_idx]
-            best_sim = max(best_sim, 0.05)  # treat as usable
+            best_sim = max(best_sim, 0.05)
 
     if not contexts:
         st.info("Couldn't retrieve relevant context. Try a more specific question.")
         st.stop()
 
-    # Build context + metadata so filename questions work
     context_text = "\n\n---\n\n".join(x["text"] for x in contexts)
+    if len(context_text) > (3500 if st.sidebar.checkbox.__doc__ else 9000):  # keeps mypy quiet
+        pass  # already controlled by CONTEXT_CHAR_LIMIT below
     if len(context_text) > CONTEXT_CHAR_LIMIT:
         context_text = context_text[:CONTEXT_CHAR_LIMIT]
 
@@ -415,29 +460,23 @@ if submitted:
     context_text = meta_line + "\n\n" + context_text
 
     if show_debug:
-        st.write({
-            "best_cosine": best_sim,
-            "top_k": TOP_K,
-            "max_new_tokens": MAX_NEW_TOKENS,
-            "chunks": len(st.session_state.docs),
-        })
+        st.write({"best_cosine": best_sim, "top_k": TOP_K, "max_new_tokens": MAX_NEW_TOKENS, "chunks": len(st.session_state.docs)})
 
-    # Confidence gate
     if strict_rag and not force_answer and (best_sim < LOW_CONFIDENCE or not context_text.strip()):
-        st.markdown("### Answer")
+        st.subheader("Answer")
         st.write("I don't know")
         st.caption("Retrieval confidence was low. (Strict mode)")
         st.session_state.turn += 1
         st.stop()
 
-    # -------- Generation --------
+    # Generate
     if not GROQ_API_KEY:
-        st.error("GROQ_API_KEY missing. Add it in Secrets.")
+        st.error("GROQ_API_KEY missing. Add it in Settings → Secrets.")
         st.stop()
 
     prompt = build_prompt(context_text, query, strict=strict_rag)
 
-    st.markdown("### Answer")
+    st.subheader("Answer")
     with st.spinner("Thinking…"):
         streamed = False
         try:
@@ -457,15 +496,15 @@ if submitted:
                 st.error(f"Generation failed: {e}")
                 st.stop()
 
-    # Minimal, useful trace
+    # Show tiny, useful trace only
     if dense_sims.size:
         st.caption("Chunk scores: " + " · ".join(f"{float(s):.3f}" for s in np.atleast_1d(dense_sims)))
-    st.caption(f"Model: {GROQ_MODEL}  •  Embeddings: {EMBED_BACKEND}")
+    st.caption(f"Model: {GROQ_MODEL} • Embeddings: {EMBED_BACKEND}")
     st.session_state.turn += 1
 
-# Footer controls
-c_clear, _ = st.columns([1, 6])
-with c_clear:
+# Bottom actions (tiny)
+col_clear, _ = st.columns([1, 6])
+with col_clear:
     if st.button("Clear session"):
         for k in list(st.session_state.keys()):
             del st.session_state[k]
