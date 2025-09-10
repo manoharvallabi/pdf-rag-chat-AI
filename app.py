@@ -21,10 +21,8 @@ TOP_K_DEFAULT = 3
 MAX_NEW_TOKENS_DEFAULT = 128
 LOW_CONFIDENCE = 0.08
 
-GROQ_MODELS = [
-    "llama3-8b-8192",
-    "gemma2-9b-it",
-]
+# Groq: single model (override via Secrets if you like)
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama3-8b-8192")
 
 # =========================
 # Text utils
@@ -169,12 +167,12 @@ def cosine_topk(q: np.ndarray, M: np.ndarray, k: int):
     return idx, sims[idx]
 
 # =========================
-# Groq generation (streaming + sync fallback)
+# Groq generation (Groq-only)
 # =========================
-def groq_stream(prompt: str, model: str, max_tokens: int):
+def groq_stream(prompt: str, max_tokens: int):
     client = get_groq()
     resp = client.chat.completions.create(
-        model=model,
+        model=GROQ_MODEL,
         messages=[
             {"role": "system", "content": "You are concise and only use the given context."},
             {"role": "user", "content": prompt},
@@ -184,7 +182,6 @@ def groq_stream(prompt: str, model: str, max_tokens: int):
         stream=True,
     )
     for chunk in resp:
-        # Some chunks don't carry content; guard it
         try:
             ch = chunk.choices[0]
             delta = getattr(ch, "delta", None)
@@ -196,23 +193,16 @@ def groq_stream(prompt: str, model: str, max_tokens: int):
 
 def groq_generate_sync(prompt: str, max_tokens: int):
     client = get_groq()
-    last_err = None
-    for model in GROQ_MODELS:
-        try:
-            resp = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": "You are concise and only use the given context."},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.2,
-                max_tokens=max_tokens,
-            )
-            return resp.choices[0].message.content.strip(), model
-        except Exception as e:
-            last_err = e
-            continue
-    raise RuntimeError(f"Groq generation failed: {last_err}")
+    resp = client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=[
+            {"role": "system", "content": "You are concise and only use the given context."},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.2,
+        max_tokens=max_tokens,
+    )
+    return resp.choices[0].message.content.strip()
 
 # =========================
 # App
@@ -338,7 +328,7 @@ if st.button("Ask"):
                 st.markdown(f"**Chunk {i} (score: {float(sims[i-1]):.3f})**\n\n{c['text']}")
         st.stop()
 
-    # generate (stream; if that fails, sync fallback)
+    # generate (Groq-only)
     if not GROQ_API_KEY:
         st.error("GROQ_API_KEY missing. Add it in Settings → Secrets.")
         st.stop()
@@ -346,31 +336,25 @@ if st.button("Ask"):
     prompt = build_prompt(context_text, query)
 
     st.markdown("### Answer")
-    used_model = None
     stream_success = False
-
-    for model in GROQ_MODELS:
-        try:
-            def _streamer():
-                for tok in groq_stream(prompt, model, MAX_NEW_TOKENS):
-                    yield tok
-
-            _ = st.write_stream(_streamer())
-            used_model = model
-            stream_success = True
-            break
-        except Exception:
-            continue
+    try:
+        def _streamer():
+            for chunk in groq_stream(prompt, MAX_NEW_TOKENS):
+                yield chunk
+        st.write_stream(_streamer())
+        stream_success = True
+    except Exception:
+        pass
 
     if not stream_success:
         try:
-            text, used_model = groq_generate_sync(prompt, MAX_NEW_TOKENS)
+            text = groq_generate_sync(prompt, MAX_NEW_TOKENS)
             st.write(text)
         except Exception as e:
             st.error(f"Generation failed: {e}")
             st.stop()
 
-    st.caption(f"Groq model: {used_model}")
+    st.caption(f"Groq model: {GROQ_MODEL}")
 
     with st.expander("Show retrieved context"):
         for i, c in enumerate(contexts, 1):
