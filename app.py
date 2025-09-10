@@ -12,7 +12,7 @@ from huggingface_hub import InferenceClient
 from groq import Groq
 
 # =========================
-# Config (env overrides)
+# Config
 # =========================
 GROQ_API_KEY   = os.getenv("GROQ_API_KEY", "")
 GROQ_MODEL     = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
@@ -28,10 +28,10 @@ MAX_NEW_TOKENS_DEF = 192
 LOW_CONFIDENCE     = 0.02
 
 # =========================
-# Default UI (clean)
+# Default UI
 # =========================
-st.set_page_config(page_title="Chat with your PDF", page_icon="📄")
-st.title("📄 Chat with your PDF")
+st.set_page_config(page_title="Chat with your PDFs", page_icon="📄")
+st.title("Chat with your PDFs")
 
 # =========================
 # Helpers
@@ -237,7 +237,7 @@ def groq_generate_sync(prompt: str, max_tokens: int) -> str:
     return resp.choices[0].message.content.strip()
 
 # =========================
-# Sidebar (slim)
+# Sidebar
 # =========================
 with st.sidebar:
     st.subheader("Settings")
@@ -255,163 +255,129 @@ CONTEXT_CHAR_LIMIT = 3500 if fast_mode else 9000
 # =========================
 # Session
 # =========================
-for key, default in [
-    ("docs", []), ("embeds", None), ("last_file", None),
-    ("uploaded_bytes", None), ("meta", {}), ("turn", 0)
-]:
-    if key not in st.session_state: st.session_state[key] = default
+if "docs_all" not in st.session_state:
+    st.session_state.docs_all = []
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
 
-uploaded = st.file_uploader("Upload a PDF", type=["pdf"])
+# =========================
+# Upload multiple PDFs
+# =========================
+uploaded_files = st.file_uploader("Upload one or more PDFs", type=["pdf"], accept_multiple_files=True)
 
-@st.cache_data(show_spinner=False)
-def _extract_pages_cached(data: bytes):
-    return pdf_to_pages(data)
-
-@st.cache_resource
-def get_embedder():
-    return Embedder(EMBED_BACKEND)
-
-def auto_index():
-    with st.spinner("Reading and indexing…"):
-        data = st.session_state.uploaded_bytes
-        pages = _extract_pages_cached(data)
+if uploaded_files:
+    for file in uploaded_files:
+        if any(doc["name"] == file.name for doc in st.session_state.docs_all):
+            continue
+        data = file.getvalue()
+        pages = pdf_to_pages(data)
         pairs = []
         for i, page_text in enumerate(pages, start=1):
-            if not page_text: continue
             paras = split_paragraphs(page_text)
             chunks = merge_to_chunks(paras, 900 if fast_mode else 1200, 120 if fast_mode else 180)
             for c in chunks:
                 if c.strip():
                     pairs.append({"text": c, "page": i})
-
         texts = [p["text"] for p in pairs]
-        if not texts:
-            st.warning("No extractable text found. If your PDF is scanned, OCR it first.")
-            st.session_state.docs, st.session_state.embeds = [], None
-            return
-
-        vecs = get_embedder().encode(texts)
-        if vecs.size == 0 or vecs.ndim != 2:
-            st.error("Embedding failed. Try a different embedding backend.")
-            return
-
-        st.session_state.docs = pairs
-        st.session_state.embeds = vecs
-        st.session_state.meta = {
-            "filename": st.session_state.last_file or "unknown.pdf",
+        vecs = Embedder(EMBED_BACKEND).encode(texts)
+        st.session_state.docs_all.append({
+            "name": file.name,
             "pages": len(pages),
-            "chunks": len(texts),
-        }
+            "pairs": pairs,
+            "embeds": vecs
+        })
 
-# New upload?
-if uploaded is not None and st.session_state.last_file != uploaded.name:
-    st.session_state.uploaded_bytes = uploaded.getvalue()
-    st.session_state.last_file = uploaded.name
-    st.session_state.docs = []
-    st.session_state.embeds = None
-    auto_index()
+if st.session_state.docs_all:
+    st.caption("Loaded files: " + ", ".join(d["name"] for d in st.session_state.docs_all))
 
-# File card
-if st.session_state.meta:
-    m = st.session_state.meta
-    st.caption(f"Loaded: {m.get('filename','?')} • Pages: {m.get('pages','?')} • Chunks: {m.get('chunks','?')}")
+# Combine all docs
+all_pairs = []
+all_embeds = []
+for doc in st.session_state.docs_all:
+    for p, v in zip(doc["pairs"], doc["embeds"]):
+        all_pairs.append(p)
+        all_embeds.append(v)
+if all_embeds:
+    embeds = np.vstack(all_embeds)
+else:
+    embeds = np.zeros((0, DEFAULT_EMBED_DIM), dtype=np.float32)
 
 # =========================
-# Ask form (minimal)
+# Display chat history
+# =========================
+for turn in st.session_state.chat_history:
+    st.chat_message("user").write(turn["user"])
+    st.chat_message("assistant").write(turn["answer"])
+
+# =========================
+# Ask form
 # =========================
 with st.form("qa", clear_on_submit=False):
-    query = st.text_input("Ask a question", value="", placeholder="e.g., Summarize, list key skills, timelines…")
-    ready = st.session_state.embeds is not None and len(st.session_state.docs) > 0
-    submitted = st.form_submit_button("Ask", use_container_width=True, disabled=not ready)
+    query = st.text_input("Ask a question", value="", placeholder="Ask about any uploaded PDF…")
+    ready = embeds.size > 0
+    submitted = st.form_submit_button("Ask", disabled=not ready)
 
 if submitted:
     msg = (query or "").strip().lower()
 
-    # Greeting rule
     if msg == "hi":
-        st.subheader("Answer")
-        if st.session_state.turn == 0:
-            st.write("Hi, happy to hep, start your questions")
-        else:
-            st.write("please continue")
-        st.session_state.turn += 1
-        st.stop()
+        answer = "Hi, happy to hep, start your questions" if len(st.session_state.chat_history)==0 else "please continue"
+        st.session_state.chat_history.append({"user": query, "answer": answer})
+        st.rerun()
 
     if not ready:
-        st.error("Upload and index a PDF first.")
+        st.error("Upload PDFs first.")
         st.stop()
 
-    # Retrieve (dense + BM25)
-    emb = get_embedder()
+    emb = Embedder(EMBED_BACKEND)
     qvec = emb.encode(query)
-    if qvec.size == 0:
-        st.error("Query embedding failed. Try again.")
-        st.stop()
-
-    dense_idx, dense_sims = cosine_topk(qvec[0], st.session_state.embeds, TOP_K)
-    contexts = [st.session_state.docs[i] for i in dense_idx] if len(dense_idx) else []
+    dense_idx, dense_sims = cosine_topk(qvec[0], embeds, TOP_K)
+    contexts = [all_pairs[i] for i in dense_idx] if len(dense_idx) else []
     best_sim = float(dense_sims.max()) if dense_sims.size else 0.0
 
     if best_sim < 0.02:
-        all_texts = [d["text"] for d in st.session_state.docs]
+        all_texts = [d["text"] for d in all_pairs]
         bm_idx, bm_scores = bm25_topk(query, all_texts, TOP_K)
         if len(bm_idx):
-            contexts = [st.session_state.docs[i] for i in bm_idx]
+            contexts = [all_pairs[i] for i in bm_idx]
             best_sim = max(best_sim, 0.05)
 
     if not contexts:
-        st.info("Couldn't retrieve relevant context. Try a more specific question.")
-        st.stop()
+        answer = "Couldn't retrieve relevant context."
+        st.session_state.chat_history.append({"user": query, "answer": answer})
+        st.rerun()
 
     context_text = "\n\n---\n\n".join(x["text"] for x in contexts)
     if len(context_text) > CONTEXT_CHAR_LIMIT:
         context_text = context_text[:CONTEXT_CHAR_LIMIT]
 
-    if show_debug:
-        st.write({"best_cosine": best_sim, "top_k": TOP_K, "max_new_tokens": MAX_NEW_TOKENS, "chunks": len(st.session_state.docs)})
-
     if strict_rag and not force_answer and (best_sim < LOW_CONFIDENCE or not context_text.strip()):
-        st.subheader("Answer")
-        st.write("I don't know")
-        st.caption("Retrieval confidence was low. (Strict mode)")
-        st.session_state.turn += 1
-        st.stop()
-
-    # Generate
-    if not GROQ_API_KEY:
-        st.error("GROQ_API_KEY missing. Add it in Settings → Secrets.")
-        st.stop()
+        answer = "I don't know"
+        st.session_state.chat_history.append({"user": query, "answer": answer})
+        st.rerun()
 
     prompt = build_prompt(context_text, query, strict=strict_rag)
 
-    st.subheader("Answer")
-    with st.spinner("Thinking…"):
-        streamed = False
-        try:
-            def _streamer():
-                for tok in groq_stream(prompt, MAX_NEW_TOKENS):
-                    yield tok
-            st.write_stream(_streamer())
-            streamed = True
-        except Exception:
-            pass
+    # generate
+    try:
+        chunks = []
+        for tok in groq_stream(prompt, MAX_NEW_TOKENS):
+            chunks.append(tok)
+        answer = "".join(chunks)
+    except Exception:
+        answer = groq_generate_sync(prompt, MAX_NEW_TOKENS)
 
-        if not streamed:
-            try:
-                text = groq_generate_sync(prompt, MAX_NEW_TOKENS)
-                st.write(text)
-            except Exception as e:
-                st.error(f"Generation failed: {e}")
-                st.stop()
+    st.session_state.chat_history.append({"user": query, "answer": answer})
+    st.rerun()
 
-    # Show tiny, useful trace only
-    if dense_sims.size:
-        st.caption("Chunk scores: " + " · ".join(f"{float(s):.3f}" for s in np.atleast_1d(dense_sims)))
-    st.caption(f"Model: {GROQ_MODEL} • Embeddings: {EMBED_BACKEND}")
-    st.session_state.turn += 1
-
-# Clear session button
-if st.button("Clear session"):
-    for k in list(st.session_state.keys()):
-        del st.session_state[k]
+# =========================
+# Clear buttons
+# =========================
+col1, col2 = st.columns(2)
+if col1.button("Clear chat"):
+    st.session_state.chat_history = []
+    st.rerun()
+if col2.button("Clear all"):
+    st.session_state.chat_history = []
+    st.session_state.docs_all = []
     st.rerun()
