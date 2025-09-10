@@ -1,6 +1,10 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+
 streamlit
 pypdf
-huggingface_hub>=0.34.0
 numpy
-requests
-openai>=1.40.0
+
+# local models
+transformers==4.44.2
+sentence-transformers==3.0.1
+torch==2.3.1
