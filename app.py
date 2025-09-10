@@ -12,10 +12,19 @@ from pypdf import PdfReader
 # ----------------------------
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
 EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"   # embeddings via serverless
-LLM_MODEL   = "google/flan-t5-base"                      # works on HF serverless
+# Use a known-working free model by default; not all google/* are on serverless.
+LLM_MODEL   = "t5-small"
 TOP_K = 4
 MAX_NEW_TOKENS = 256
 TEMPERATURE = 0.2
+
+# If a model 404s, we try these in order automatically.
+LLM_FALLBACKS = [
+    "t5-small",
+    "google/flan-t5-small",
+    "bigscience/mt0-small",
+    "facebook/bart-base",
+]
 
 # ----------------------------
 # Utils
@@ -92,13 +101,13 @@ def cosine_topk(query_vec: np.ndarray, matrix: np.ndarray, k: int):
     return idx, sims[idx]
 
 # ----------------------------
-# Serverless generation via HTTP
+# Serverless generation via HTTP (robust)
 # ----------------------------
 def hf_generate_http(model_id: str, prompt: str, max_new_tokens: int = MAX_NEW_TOKENS):
     """
     Call Hugging Face serverless inference endpoint directly.
-    Works for both text-generation and text2text-generation models.
-    Handles 503 "loading" responses with a short retry.
+    Works for text-generation and text2text-generation models.
+    Handles 503 "loading" with short retries.
     """
     url = f"https://api-inference.huggingface.co/models/{model_id}"
     headers = {"Authorization": f"Bearer {HF_TOKEN}"}
@@ -106,23 +115,42 @@ def hf_generate_http(model_id: str, prompt: str, max_new_tokens: int = MAX_NEW_T
 
     for attempt in range(5):
         r = requests.post(url, headers=headers, json=payload, timeout=120)
-        # If model is loading, HF returns 503 + estimated_time
         if r.status_code == 503:
+            # model warming up
             try:
-                wait = r.json().get("estimated_time", 5)
+                wait = float(r.json().get("estimated_time", 5))
             except Exception:
                 wait = 5
             time.sleep(min(20, wait + 1))
             continue
+        if r.status_code == 404:
+            raise FileNotFoundError(f"Model not available on serverless: {model_id}")
         r.raise_for_status()
+
         out = r.json()
-        # Normalize response
+        # Normalize common shapes
         if isinstance(out, list) and out and isinstance(out[0], dict):
-            return out[0].get("generated_text") or out[0].get("translation_text") or str(out[0])
+            return out[0].get("generated_text") or out[0].get("translation_text") or out[0].get("summary_text") or str(out[0])
         if isinstance(out, dict):
-            return out.get("generated_text") or out.get("answer") or str(out)
+            return out.get("generated_text") or out.get("answer") or out.get("translation_text") or out.get("summary_text") or str(out)
         return str(out)
+
     raise RuntimeError("HF serverless generation retry limit exceeded")
+
+def generate_with_fallback(model_id: str, prompt: str):
+    # Try requested model, then fallbacks if 404/other issues
+    candidates = [model_id] + [m for m in LLM_FALLBACKS if m != model_id]
+    last_err = None
+    for mid in candidates:
+        try:
+            return hf_generate_http(mid, prompt, MAX_NEW_TOKENS), mid
+        except FileNotFoundError:
+            last_err = f"{mid} not on serverless"
+            continue
+        except Exception as e:
+            last_err = str(e)
+            continue
+    raise RuntimeError(f"All serverless attempts failed. Last error: {last_err}")
 
 # ----------------------------
 # App
@@ -180,13 +208,14 @@ if go:
     else:
         prompt = build_prompt(context_text, query)
         try:
-            answer = hf_generate_http(llm_model_id, prompt, MAX_NEW_TOKENS)
+            answer, used_model = generate_with_fallback(llm_model_id.strip(), prompt)
         except Exception as e:
             st.error(f"Generation failed: {e}")
             st.stop()
 
         st.markdown("### Answer")
         st.write((answer or "").strip())
+        st.caption(f"Model: {used_model}")
 
         with st.expander("Show retrieved context"):
             for i, c in enumerate(contexts, 1):
