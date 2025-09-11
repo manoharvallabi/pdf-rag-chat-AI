@@ -172,20 +172,6 @@ def groq_generate(prompt: str, max_tokens: int):
 st.set_page_config(page_title="Chat with your PDFs", page_icon="📄")
 st.title("Chat with your PDFs")
 
-# Minimal CSS for Clear chat button
-st.markdown("""
-<style>
-div.stButton > button[kind="secondary"] {
-    background: none !important;
-    border: none !important;
-    color: #007AFF !important;
-    text-decoration: underline !important;
-    font-size: 14px !important;
-    padding: 0 !important;
-}
-</style>
-""", unsafe_allow_html=True)
-
 if "chat_history" not in st.session_state: st.session_state.chat_history = []
 if "docs_all" not in st.session_state: st.session_state.docs_all = []
 if "embeds" not in st.session_state: st.session_state.embeds = None
@@ -226,7 +212,7 @@ if st.session_state.docs_all:
 
 # Clear chat button
 if len(st.session_state.chat_history)>0:
-    if st.button("Clear chat", key="clear_chat", help="Clear chat", type="secondary"):
+    if st.button("Clear chat", key="clear_chat"):
         st.session_state.chat_history=[]
         st.rerun()
 
@@ -245,8 +231,8 @@ if submitted and query:
         st.session_state.chat_history.append({"role":"assistant","content":answer})
         st.rerun()
 
-    # special: how many docs
-    if "how many" in msg and "document" in msg:
+    # special: how many docs (broader match)
+    if any(word in msg for word in ["how many", "number"]) and any(word in msg for word in ["document", "pdf", "pdfs", "files", "docs"]):
         count = len({d["name"] for d in st.session_state.docs_all})
         answer = f"You currently have {count} PDF document{'s' if count!=1 else ''} uploaded."
         st.session_state.chat_history.append({"role":"user","content":query})
@@ -272,9 +258,13 @@ if submitted and query:
     st.session_state.chat_history.append({"role":"assistant","content":answer})
     st.rerun()
 
-# Chat display
-for msg in st.session_state.chat_history:
+# SVG Icons
+person_svg = """<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-linecap="round"><circle cx="9.5" cy="5.5" r="3"/><path d="M15 16.5v-2c0-3.098-2.495-6-5.5-6c-3.006 0-5.5 2.902-5.5 6v2"/></svg>"""
+robot_svg = """<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 2048 2048"><path fill="currentColor" d="M640 768h128v128H640V768zm512 0h128v128h-128V768zm469 640q35 0 66 13t54 37t37 55t14 66v469h-128v-469q0-18-12-30t-31-13H299q-18 0-30 12t-13 31v469H128v-469q0-35 13-66t37-54t54-37t67-14h341v-128h-85q-35 0-66-13t-55-37t-36-54t-14-67v-85H256V768h128v-85q0-35 13-66t37-54t54-37t67-14h341V303q-29-17-46-47t-18-64q0-27 10-50t27-40t41-28t50-10q27 0 50 10t40 27t28 41t10 50q0 34-17 64t-47 47v209h341q35 0 66 13t54 37t37 55t14 66v85h128v256h-128v85q0 35-13 66t-37 55t-55 36t-66 14h-85v128h341zM512 1109q0 18 12 30t31 13h810q18 0 30-12t13-31V683q0-18-12-30t-31-13H555q-18 0-30 12t-13 31v426zm256 299h384v-128H768v128z"/></svg>"""
+
+# Chat display (newest on top)
+for msg in reversed(st.session_state.chat_history):
     if msg["role"]=="user":
-        st.markdown(f"<div style='display:flex;align-items:center;'><span style='font-size:20px;margin-right:6px;'>👤</span>{msg['content']}</div>", unsafe_allow_html=True)
+        st.markdown(f"<div style='display:flex;align-items:center;gap:6px;'>{person_svg}<span>{msg['content']}</span></div>", unsafe_allow_html=True)
     else:
-        st.markdown(f"<div style='display:flex;align-items:center;'><span style='font-size:20px;margin-right:6px;'>🤖</span>{msg['content']}</div>", unsafe_allow_html=True)
+        st.markdown(f"<div style='display:flex;align-items:center;gap:6px;'>{robot_svg}<span>{msg['content']}</span></div>", unsafe_allow_html=True)
