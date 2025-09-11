@@ -1,6 +1,5 @@
 import io
 import os
-import re
 import time
 import numpy as np
 import streamlit as st
@@ -8,6 +7,7 @@ from pypdf import PdfReader
 from pdfminer.high_level import extract_text as pdfminer_extract_text
 from huggingface_hub import InferenceClient
 from groq import Groq
+import re
 
 # =========================
 # Config
@@ -16,11 +16,13 @@ HF_TOKEN = os.environ.get("HF_TOKEN", "")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 DEFAULT_EMBED_DIM = 384
-TOP_K = 3
-MAX_NEW_TOKENS = 128
+TOP_K_DEFAULT = 3
+MAX_NEW_TOKENS_DEFAULT = 128
+
+GROQ_MODEL = "llama-3.1-8b-instant"
 
 # =========================
-# SVG ICONS
+# SVG Icons
 # =========================
 USER_SVG = """
 <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 20 20" fill="none" stroke="#666" stroke-linecap="round">
@@ -36,69 +38,44 @@ BOT_SVG = """
 """
 
 # =========================
-# Styles
-# =========================
-st.markdown("""
-<style>
-/* put Ask + Clear Chat on same row */
-.ask-row {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    margin-top: 6px;
-}
-.clear-chat {
-    cursor: pointer;
-    color: #0073e6;
-    font-size: 14px;
-    text-decoration: underline;
-}
-</style>
-""", unsafe_allow_html=True)
-
-# =========================
-# Helper functions
+# Utils
 # =========================
 def clean_text(s: str) -> str:
-    if not s: return ""
+    if not s:
+        return ""
     s = re.sub(r"(\w)-\n(\w)", r"\1\2", s)
     s = re.sub(r"[ \t]*\n[ \t]*", " ", s)
     s = re.sub(r"[ \t]{2,}", " ", s)
     return s.strip()
 
-def pdf_to_text_chunks(data: bytes) -> list[str]:
+def pdf_to_pages(data: bytes) -> list[str]:
     pages = []
     try:
         reader = PdfReader(io.BytesIO(data))
         for p in reader.pages:
-            pages.append(clean_text(p.extract_text() or ""))
+            t = p.extract_text() or ""
+            pages.append(clean_text(t))
     except Exception:
         pages = []
-    if sum(len(p) for p in pages) < 500:
+    if sum(len(p or "") for p in pages) < 500:
         try:
             text_all = pdfminer_extract_text(io.BytesIO(data)) or ""
             pages = [clean_text(x) for x in text_all.split("\f")]
         except Exception:
             pass
-    return [p for p in pages if p]
+    return pages
 
+@st.cache_resource
 def get_embedder():
     return InferenceClient(model=EMBED_MODEL, token=HF_TOKEN)
 
-def embed_texts(texts):
-    client = get_embedder()
-    arr = []
-    for t in texts:
-        try:
-            out = client.feature_extraction(t)
-            arr.append(np.mean(np.asarray(out, dtype=np.float32), axis=0))
-        except:
-            arr.append(np.zeros((DEFAULT_EMBED_DIM,), dtype=np.float32))
-    return np.vstack(arr)
+@st.cache_resource
+def get_groq():
+    return Groq(api_key=GROQ_API_KEY)
 
-def cosine_topk(q: np.ndarray, M: np.ndarray, k: int):
+def cosine_topk(q, M, k):
     if M.size == 0 or q.size == 0:
-        return np.array([], dtype=int), np.array([])
+        return [], []
     qn = q / (np.linalg.norm(q) + 1e-9)
     Mn = M / (np.linalg.norm(M, axis=1, keepdims=True) + 1e-9)
     sims = (Mn @ qn.reshape(-1, 1)).ravel()
@@ -107,87 +84,83 @@ def cosine_topk(q: np.ndarray, M: np.ndarray, k: int):
     idx = idx[np.argsort(-sims[idx])]
     return idx, sims[idx]
 
-def groq_answer(prompt: str):
-    client = Groq(api_key=GROQ_API_KEY)
-    resp = client.chat.completions.create(
-        model="llama-3.1-8b-instant",
-        messages=[
-            {"role": "system", "content": "Answer using only the given context."},
-            {"role": "user", "content": prompt}
-        ],
-        temperature=0.2,
-        max_tokens=MAX_NEW_TOKENS,
-    )
-    return resp.choices[0].message.content.strip()
+def build_prompt(context, question):
+    return f"""Answer strictly using the provided context. 
+If the answer is not in the context, reply "I don't know".
+
+Context:
+{context}
+
+Question: {question}
+Answer:"""
 
 # =========================
-# State
+# App
 # =========================
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
+st.set_page_config(page_title="PDF Chat", page_icon="📄")
+
 if "docs" not in st.session_state:
     st.session_state.docs = []
 if "embeds" not in st.session_state:
     st.session_state.embeds = None
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
 
-# =========================
-# Upload PDFs
-# =========================
 st.title("Chat with your PDFs")
+
 uploaded_files = st.file_uploader("Upload one or more PDFs", type=["pdf"], accept_multiple_files=True)
 
 if uploaded_files:
-    all_texts = []
     st.session_state.docs = []
-    for uf in uploaded_files:
-        pages = pdf_to_text_chunks(uf.read())
+    texts = []
+    for file in uploaded_files:
+        data = file.read()
+        pages = pdf_to_pages(data)
         for p in pages:
-            st.session_state.docs.append({"text": p})
-            all_texts.append(p)
-    if all_texts:
-        st.session_state.embeds = embed_texts(all_texts)
-        st.success(f"Loaded {len(uploaded_files)} PDF(s) with {len(all_texts)} chunks.")
-else:
-    st.session_state.docs = []
-    st.session_state.embeds = None
+            if p.strip():
+                st.session_state.docs.append({"text": p})
+                texts.append(p)
+    if texts:
+        embedder = get_embedder()
+        vecs = np.vstack([np.mean(embedder.feature_extraction(t), axis=0) for t in texts])
+        st.session_state.embeds = vecs
+        st.success(f"Loaded {len(uploaded_files)} PDF(s) with {len(texts)} chunks.")
 
-# =========================
-# Input Row
-# =========================
-query = st.text_input("Ask about any uploaded PDF...", key="query_input")
+query = st.text_input("Ask about any uploaded PDF...")
 
-st.markdown('<div class="ask-row">', unsafe_allow_html=True)
-ask_clicked = st.button("Ask", key="askbutton")
-if st.session_state.chat_history:
-    if st.button("Clear chat", key="clearchat", help="Clear all messages"):
+col1, col2 = st.columns([1,5])
+with col1:
+    ask_clicked = st.button("Ask")
+with col2:
+    if st.button("Clear chat"):
         st.session_state.chat_history = []
-        st.experimental_rerun()
-st.markdown('</div>', unsafe_allow_html=True)
 
-# =========================
-# Handle Ask
-# =========================
-if ask_clicked and query.strip():
-    st.session_state.chat_history.insert(0, {"role": "user", "content": query})
-    if st.session_state.embeds is None or len(st.session_state.docs) == 0:
-        st.session_state.chat_history.insert(0, {"role": "bot", "content": "Upload PDFs first."})
+# display newest first
+for chat in reversed(st.session_state.chat_history):
+    if chat["role"] == "user":
+        st.markdown(f"<div style='display:flex;align-items:center;'>{USER_SVG}&nbsp;{chat['content']}</div>", unsafe_allow_html=True)
     else:
-        qvec = embed_texts([query])[0]
-        idx, sims = cosine_topk(qvec, st.session_state.embeds, TOP_K)
-        if len(idx) == 0:
-            st.session_state.chat_history.insert(0, {"role": "bot", "content": "I don't know."})
+        st.markdown(f"<div style='display:flex;align-items:center;'>{BOT_SVG}&nbsp;{chat['content']}</div>", unsafe_allow_html=True)
+
+if ask_clicked and query.strip():
+    st.session_state.chat_history.append({"role": "user", "content": query})
+    if st.session_state.embeds is None:
+        st.session_state.chat_history.append({"role": "bot", "content": "Upload PDFs first."})
+    else:
+        embedder = get_embedder()
+        qvec = np.mean(embedder.feature_extraction(query), axis=0)
+        idx, sims = cosine_topk(qvec, st.session_state.embeds, TOP_K_DEFAULT)
+        if not idx.any():
+            context_text = ""
         else:
             context_text = "\n\n".join(st.session_state.docs[i]["text"] for i in idx)
-            prompt = f"Context:\n{context_text}\n\nQuestion: {query}\nAnswer:"
-            answer = groq_answer(prompt)
-            st.session_state.chat_history.insert(0, {"role": "bot", "content": answer})
-    st.experimental_rerun()
-
-# =========================
-# Show Chat (newest first at top)
-# =========================
-for chat in st.session_state.chat_history:
-    if chat["role"] == "user":
-        st.markdown(f"<div style='display:flex;align-items:center;margin-bottom:4px;'>{USER_SVG}&nbsp;{chat['content']}</div>", unsafe_allow_html=True)
-    else:
-        st.markdown(f"<div style='display:flex;align-items:center;margin-bottom:4px;'>{BOT_SVG}&nbsp;{chat['content']}</div>", unsafe_allow_html=True)
+        prompt = build_prompt(context_text, query)
+        client = get_groq()
+        resp = client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[{"role": "system", "content": "Answer concisely from context only"},
+                      {"role": "user", "content": prompt}],
+            max_tokens=MAX_NEW_TOKENS_DEFAULT,
+        )
+        answer = resp.choices[0].message.content.strip()
+        st.session_state.chat_history.append({"role": "bot", "content": answer})
