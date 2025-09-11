@@ -16,7 +16,7 @@ EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 DEFAULT_EMBED_DIM = 384
 TOP_K_DEFAULT = 3
 MAX_NEW_TOKENS_DEFAULT = 128
-GROQ_MODELS = ["llama-3.1-8b-instant"]  # stable
+GROQ_MODELS = ["llama-3.1-8b-instant"]
 
 # =========================
 # Text utils
@@ -50,7 +50,6 @@ def merge_to_chunks(paras: list[str], target: int = 900, overlap: int = 120) -> 
     return chunks
 
 def pdf_to_pages(data: bytes) -> list[str]:
-    """Extract text from PDF pages, fallback to pdfminer if needed."""
     pages = []
     try:
         reader = PdfReader(io.BytesIO(data))
@@ -172,20 +171,40 @@ def groq_generate(prompt: str, max_tokens: int):
 st.set_page_config(page_title="Chat with your PDFs", page_icon="🔎")
 st.title("Chat with your PDFs")
 
+# CSS
+st.markdown("""
+<style>
+.clear-btn {
+    background: none;
+    border: none;
+    color: inherit;
+    font-size: 14px;
+    cursor: pointer;
+}
+.icon {
+    width:20px !important;
+    height:20px !important;
+    flex-shrink:0;
+}
+.chat-row {
+    margin-bottom: 15px;
+}
+</style>
+""", unsafe_allow_html=True)
+
 if "chat_history" not in st.session_state: st.session_state.chat_history = []
 if "docs_all" not in st.session_state: st.session_state.docs_all = []
 if "embeds" not in st.session_state: st.session_state.embeds = None
 
 uploaded_files = st.file_uploader("Upload one or more PDFs", type=["pdf"], accept_multiple_files=True)
 
-# Sync docs
+# Sync docs with uploader
 if not uploaded_files:
     st.session_state.docs_all = []
     st.session_state.embeds = None
 else:
     current_names = {f.name for f in uploaded_files}
     st.session_state.docs_all = [d for d in st.session_state.docs_all if d["name"] in current_names]
-
     for file in uploaded_files:
         if any(doc["name"] == file.name for doc in st.session_state.docs_all):
             continue
@@ -210,44 +229,40 @@ else:
 if st.session_state.docs_all:
     st.caption("Loaded files: " + ", ".join(sorted({d["name"] for d in st.session_state.docs_all})))
 
-# =========================
-# Ask form with Ask + Clear
-# =========================
-with st.form("qa", clear_on_submit=True):
-    query = st.text_input("Ask a question", placeholder="Ask about any uploaded PDF…")
-    col1, col2 = st.columns([1,0.3])
-    with col1:
-        submitted = st.form_submit_button("Ask")
-    with col2:
-        if len(st.session_state.chat_history) > 0:
-            if st.form_submit_button("Clear chat", help="Clear chat"):
-                st.session_state.chat_history=[]
-                st.experimental_rerun()
+# Ask form
+query = st.text_input("Ask a question", placeholder="Ask about any uploaded PDF…")
+col1, col2 = st.columns([1,5])
+ask_clicked = col1.button("Ask")
+if len(st.session_state.chat_history) > 0:
+    clear_clicked = col2.button("Clear chat", help="Clear chat", key="clear_chat", use_container_width=False)
+else:
+    clear_clicked = False
 
-if submitted and query:
+if clear_clicked:
+    st.session_state.chat_history = []
+    st.rerun()
+
+if ask_clicked and query:
     msg = query.strip().lower()
 
-    # special: hi
     if msg == "hi":
         answer = "Hi, happy to help, start your questions" if len(st.session_state.chat_history)==0 else "please continue"
-        st.session_state.chat_history.append({"role":"user","content":query})
-        st.session_state.chat_history.append({"role":"assistant","content":answer})
-        st.experimental_rerun()
+        st.session_state.chat_history.insert(0,{"role":"assistant","content":answer})
+        st.session_state.chat_history.insert(0,{"role":"user","content":query})
+        st.rerun()
 
-    # special: name
     if "your name" in msg:
         answer = "I'm a chatbot."
-        st.session_state.chat_history.append({"role":"user","content":query})
-        st.session_state.chat_history.append({"role":"assistant","content":answer})
-        st.experimental_rerun()
+        st.session_state.chat_history.insert(0,{"role":"assistant","content":answer})
+        st.session_state.chat_history.insert(0,{"role":"user","content":query})
+        st.rerun()
 
-    # special: how many docs
     if "how many" in msg and ("document" in msg or "pdf" in msg):
         count = len({d["name"] for d in st.session_state.docs_all})
         answer = f"You currently have {count} PDF document{'s' if count!=1 else ''} uploaded."
-        st.session_state.chat_history.append({"role":"user","content":query})
-        st.session_state.chat_history.append({"role":"assistant","content":answer})
-        st.experimental_rerun()
+        st.session_state.chat_history.insert(0,{"role":"assistant","content":answer})
+        st.session_state.chat_history.insert(0,{"role":"user","content":query})
+        st.rerun()
 
     if st.session_state.embeds is None or st.session_state.embeds.size==0:
         st.error("Upload a PDF first.")
@@ -265,14 +280,19 @@ if submitted and query:
 
     st.session_state.chat_history.insert(0,{"role":"assistant","content":answer})
     st.session_state.chat_history.insert(0,{"role":"user","content":query})
-    st.experimental_rerun()
+    st.rerun()
 
-# =========================
-# Chat display
-# =========================
-person_svg = """<svg width="24" height="24" viewBox="0 0 20 20" fill="none" stroke="white" stroke-linecap="round"><circle cx="9.5" cy="5.5" r="3"/><path d="M15 16.5v-2c0-3.098-2.495-6-5.5-6c-3.006 0-5.5 2.902-5.5 6v2"/></svg>"""
-robot_svg = """<svg width="24" height="24" viewBox="0 0 2048 2048" fill="white"><path d="M640 768h128v128H640V768zm512 0h128v128h-128V768zm469 640q35 0 66 13t54 37t37 55t14 66v469h-128v-469q0-18-12-30t-31-13H299q-18 0-30 12t-13 31v469H128v-469q0-35 13-66t37-54t54-37t67-14h341v-128h-85q-35 0-66-13t-55-37t-36-54t-14-67v-85H256V768h128v-85q0-35 13-66t37-54t54-37t67-14h341V303q-29-17-46-47t-18-64q0-27 10-50t27-40t41-28t50-10q27 0 50 10t40 27t28 41t10 50q0 34-17 64t-47 47v209h341q35 0 66 13t54 37t37 55t14 66v85h128v256h-128v85q0 35-13 66t-37 55t-55 36t-66 14h-85v128h341zM512 1109q0 18 12 30t31 13h810q18 0 30-12t13-31V683q0-18-12-30t-31-13H555q-18 0-30 12t-13 31v426zm256 299h384v-128H768v128z"/></svg>"""
-
+# Chat display (newest on top)
 for msg in st.session_state.chat_history:
-    icon = person_svg if msg["role"]=="user" else robot_svg
-    st.markdown(f"<div style='display:flex;align-items:flex-start;gap:8px;margin-bottom:8px;'>{icon}<div style='flex:1'>{msg['content']}</div></div>", unsafe_allow_html=True)
+    if msg["role"]=="user":
+        st.markdown(
+            f"<div class='chat-row' style='display:flex;align-items:flex-start;'>"
+            f"<svg class='icon' xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20'><g fill='none' stroke='currentColor' stroke-linecap='round'><circle cx='9.5' cy='5.5' r='3'/><path d='M15 16.5v-2c0-3.098-2.495-6-5.5-6c-3.006 0-5.5 2.902-5.5 6v2'/></g></svg>"
+            f"<span style='margin-left:8px;'>{msg['content']}</span></div>",
+            unsafe_allow_html=True)
+    else:
+        st.markdown(
+            f"<div class='chat-row' style='display:flex;align-items:flex-start;'>"
+            f"<svg class='icon' xmlns='http://www.w3.org/2000/svg' viewBox='0 0 2048 2048'><path fill='currentColor' d='M640 768h128v128H640V768zm512 0h128v128h-128V768zm469 640q35 0 66 13t54 37t37 55t14 66v469h-128v-469q0-18-12-30t-31-13H299q-18 0-30 12t-13 31v469H128v-469q0-35 13-66t37-54t54-37t67-14h341v-128h-85q-35 0-66-13t-55-37t-36-54t-14-67v-85H256V768h128v-85q0-35 13-66t37-54t54-37t67-14h341V303q-29-17-46-47t-18-64q0-27 10-50t27-40t41-28t50-10q27 0 50 10t40 27t28 41t10 50q0 34-17 64t-47 47v209h341q35 0 66 13t54 37t37 55t14 66v85h128v256h-128v85q0 35-13 66t-37 55t-55 36t-66 14h-85v128h341zM512 1109q0 18 12 30t31 13h810q18 0 30-12t13-31V683q0-18-12-30t-31-13H555q-18 0-30 12t-13 31v426zm256 299h384v-128H768v128z'/></svg>"
+            f"<span style='margin-left:8px;'>{msg['content']}</span></div>",
+            unsafe_allow_html=True)
