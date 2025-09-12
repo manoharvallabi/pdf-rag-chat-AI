@@ -6,7 +6,6 @@ A zero-cost, deployable doc chatbot. Upload a PDF, ask questions, get answers gr
 - **LLM:** Hugging Face Inference API (`Qwen/Qwen2-1.5B-Instruct` by default)
 - **Vector store:** In-memory ChromaDB
 - **UI:** Streamlit
-- **Cost:** $0 (no OpenAI, no GPU, no Torch)
 
 ## Quickstart
 
@@ -47,11 +46,4 @@ HF_TOKEN="your_token_here"
 - **Slow/Rate-limited** → Keep small models; reduce `MAX_NEW_TOKENS`.
 - **Weak answers** → Increase `TOP_K` to 5–6, ask specific questions, ensure your PDF has extractable text.
 
-## Make it portfolio-ready
-- Add your live link at the top of this README.
-- Include 2–3 screenshots (indexing, Q&A).
-- Use your resume as the default demo PDF for “chat with my resume”.
-
----
-
-**License:** MIT (optional — add your preferred license)
+**License:** MIT 
