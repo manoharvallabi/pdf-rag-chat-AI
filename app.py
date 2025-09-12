@@ -1,4 +1,4 @@
-  import io, os, time, re
+import io, os, time, re
 import numpy as np
 import streamlit as st
 from pypdf import PdfReader
