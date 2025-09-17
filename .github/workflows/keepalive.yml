@@ -2,12 +2,12 @@ name: Keep Streamlit Alive
 
 on:
   schedule:
-    - cron: "*/10 * * * *"   # runs every 10 minutes
-  workflow_dispatch:         # lets you trigger manually if needed
+    - cron: "*/10 * * * *"   # every 10 minutes (UTC)
+  workflow_dispatch:         # lets you run it manually from GitHub
 
 jobs:
   ping:
     runs-on: ubuntu-latest
     steps:
       - name: Curl Streamlit app
-        run: curl -s https://pdf-rag-chat-ai.streamlit.app > /dev/null
+        run: curl -s https://pdf-rag-chat-ai.streamlit.app || true
