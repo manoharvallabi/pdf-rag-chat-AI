@@ -3,17 +3,18 @@ import numpy as np
 import streamlit as st
 from pypdf import PdfReader
 from pdfminer.high_level import extract_text as pdfminer_extract_text
-from huggingface_hub import InferenceClient
 from groq import Groq
 
 # =========================
 # Config
 # =========================
-HF_TOKEN = os.environ.get("HF_TOKEN", "")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+if not GROQ_API_KEY:
+    st.error("GROQ_API_KEY not set.")
+    st.stop()
 
-EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-DEFAULT_EMBED_DIM = 384
+EMBED_MODEL = "nomic-embed-text"  # Groq embedding model
+DEFAULT_EMBED_DIM = 512  # nomic-embed-text dim
 TOP_K_DEFAULT = 3
 MAX_NEW_TOKENS_DEFAULT = 128
 GROQ_MODELS = ["llama-3.1-8b-instant"]
@@ -77,61 +78,28 @@ def build_prompt(context: str, question: str) -> str:
     )
 
 # =========================
-# Cached clients/resources
+# Groq clients/resources
 # =========================
-@st.cache_resource
-def get_hf_client(model_id: str, token: str | None):
-    return InferenceClient(model=model_id, token=token)
-
 @st.cache_resource
 def get_groq():
-    if not GROQ_API_KEY:
-        raise RuntimeError("GROQ_API_KEY not set.")
     return Groq(api_key=GROQ_API_KEY)
 
-@st.cache_resource
-def get_embedder(model_id: str, token: str | None):
-    return HFEmbedder(model_id, token)
-
 # =========================
-# Embeddings
+# Embeddings (Groq)
 # =========================
-class HFEmbedder:
-    def __init__(self, model_id: str, token: str | None, default_dim: int = DEFAULT_EMBED_DIM):
-        self.client = get_hf_client(model_id, token)
-        self.default_dim = default_dim
-        self._dim = None
-
-    def _pool(self, out):
-        if isinstance(out, list) and out:
-            if isinstance(out[0], list):
-                arr = np.asarray(out, dtype=np.float32)
-                return arr.mean(axis=0)
-            return np.asarray(out, dtype=np.float32)
-        return np.asarray([], dtype=np.float32)
-
-    def encode_one(self, text: str, retries: int = 3, backoff: float = 0.6) -> np.ndarray:
-        last_err = None
-        for i in range(retries):
-            try:
-                out = self.client.feature_extraction(text)
-                vec = self._pool(out)
-                if vec.size:
-                    if self._dim is None:
-                        self._dim = int(vec.shape[-1])
-                    return vec.astype(np.float32)
-            except Exception as e:
-                last_err = e
-            time.sleep(backoff * (i + 1))
-        dim = self._dim or self.default_dim
-        return np.zeros((dim,), dtype=np.float32)
+class GroqEmbedder:
+    def __init__(self, model=EMBED_MODEL):
+        self.model = model
+        self.client = get_groq()
+        self.dim = DEFAULT_EMBED_DIM
 
     def encode(self, texts):
-        if isinstance(texts, str): texts = [texts]
-        vecs = [self.encode_one(t) for t in texts]
-        dim = self._dim or self.default_dim
-        vecs = [v if v.size else np.zeros((dim,), dtype=np.float32) for v in vecs]
-        return np.vstack(vecs) if vecs else np.zeros((0, dim), dtype=np.float32)
+        if isinstance(texts, str):
+            texts = [texts]
+        resp = self.client.embeddings.create(model=self.model, input=texts)
+        vecs = [np.array(d.embedding, dtype=np.float32) for d in resp.data]
+        self.dim = len(vecs[0])
+        return np.vstack(vecs)
 
 def normalize_rows(M: np.ndarray) -> np.ndarray:
     if M.size == 0: return M
@@ -205,6 +173,7 @@ if not uploaded_files:
 else:
     current_names = {f.name for f in uploaded_files}
     st.session_state.docs_all = [d for d in st.session_state.docs_all if d["name"] in current_names]
+    embedder = GroqEmbedder()  # initialize once
     for file in uploaded_files:
         if any(doc["name"] == file.name for doc in st.session_state.docs_all):
             continue
@@ -218,13 +187,13 @@ else:
             for c in chunks:
                 if c.strip(): pairs.append({"text": c, "page": i})
         texts = [p["text"] for p in pairs]
-        embedder = get_embedder(EMBED_MODEL, HF_TOKEN)
-        vecs = embedder.encode(texts)
-        st.session_state.docs_all.extend([{"name": file.name, "text": t} for t in texts])
-        if st.session_state.embeds is None:
-            st.session_state.embeds = vecs
-        else:
-            st.session_state.embeds = np.vstack([st.session_state.embeds, vecs])
+        if texts:
+            vecs = embedder.encode(texts)
+            st.session_state.docs_all.extend([{"name": file.name, "text": t} for t in texts])
+            if st.session_state.embeds is None:
+                st.session_state.embeds = vecs
+            else:
+                st.session_state.embeds = np.vstack([st.session_state.embeds, vecs])
 
 if st.session_state.docs_all:
     st.caption("Loaded files: " + ", ".join(sorted({d["name"] for d in st.session_state.docs_all})))
@@ -268,7 +237,7 @@ if ask_clicked and query:
         st.error("Upload a PDF first.")
         st.stop()
 
-    embedder = get_embedder(EMBED_MODEL, HF_TOKEN)
+    embedder = GroqEmbedder()
     qvec = embedder.encode(query)
     idx, sims = cosine_topk(qvec[0], st.session_state.embeds, TOP_K_DEFAULT)
     if len(idx)==0:
