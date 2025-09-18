@@ -1,4 +1,4 @@
-import io, os, time, re
+import io, os, re
 import numpy as np
 import streamlit as st
 from pypdf import PdfReader
@@ -14,7 +14,7 @@ if not GROQ_API_KEY:
     st.stop()
 
 EMBED_MODEL = "nomic-embed-text"  # Groq embedding model
-DEFAULT_EMBED_DIM = 512  # nomic-embed-text dim
+DEFAULT_EMBED_DIM = 512
 TOP_K_DEFAULT = 3
 MAX_NEW_TOKENS_DEFAULT = 128
 GROQ_MODELS = ["llama-3.1-8b-instant"]
@@ -72,8 +72,8 @@ def pdf_to_pages(data: bytes) -> list[str]:
 
 def build_prompt(context: str, question: str) -> str:
     return (
-        "Answer strictly using the provided context. "
-        "If the answer is not in the context, reply with \"I don't know\".\n\n"
+        "Use the provided context to answer as much as possible. "
+        "If the question is not answered by the context, respond naturally as a helpful assistant. "
         f"Context:\n{context}\n\nQuestion: {question}\nAnswer:"
     )
 
@@ -125,10 +125,11 @@ def groq_generate(prompt: str, max_tokens: int):
         resp = client.chat.completions.create(
             model=model,
             messages=[
-                {"role": "system", "content": "You are concise and only use the given context."},
+                {"role": "system", "content":
+                 "You are a helpful, friendly assistant. Use the provided context when it is relevant, otherwise answer normally."},
                 {"role": "user", "content": prompt},
             ],
-            temperature=0.2,
+            temperature=0.3,  # slightly more creative for natural replies
             max_tokens=max_tokens,
         )
         return resp.choices[0].message.content.strip(), model
@@ -139,7 +140,6 @@ def groq_generate(prompt: str, max_tokens: int):
 st.set_page_config(page_title="Chat with your PDFs", page_icon="🔎")
 st.title("Chat with your PDFs")
 
-# CSS
 st.markdown("""
 <style>
 .clear-btn {
@@ -211,47 +211,70 @@ if clear_clicked:
     st.session_state.chat_history = []
     st.rerun()
 
+# =========================
+# Question handling
+# =========================
 if ask_clicked and query:
     msg = query.strip().lower()
 
+    # quick responses
     if msg == "hi":
-        answer = "Hi, happy to help, start your questions" if len(st.session_state.chat_history)==0 else "please continue"
-        st.session_state.chat_history.insert(0,{"role":"assistant","content":answer})
-        st.session_state.chat_history.insert(0,{"role":"user","content":query})
+        answer = "Hi, happy to help — start your questions!"
+        st.session_state.chat_history.insert(0, {"role": "assistant", "content": answer})
+        st.session_state.chat_history.insert(0, {"role": "user", "content": query})
         st.rerun()
 
     if "your name" in msg:
-        answer = "I'm a chatbot."
-        st.session_state.chat_history.insert(0,{"role":"assistant","content":answer})
-        st.session_state.chat_history.insert(0,{"role":"user","content":query})
+        answer = "I'm a chatbot powered by Groq."
+        st.session_state.chat_history.insert(0, {"role": "assistant", "content": answer})
+        st.session_state.chat_history.insert(0, {"role": "user", "content": query})
         st.rerun()
 
     if "how many" in msg and ("document" in msg or "pdf" in msg):
         count = len({d["name"] for d in st.session_state.docs_all})
-        answer = f"You currently have {count} PDF document{'s' if count!=1 else ''} uploaded."
-        st.session_state.chat_history.insert(0,{"role":"assistant","content":answer})
-        st.session_state.chat_history.insert(0,{"role":"user","content":query})
+        answer = f"You currently have {count} PDF document{'s' if count != 1 else ''} uploaded."
+        st.session_state.chat_history.insert(0, {"role": "assistant", "content": answer})
+        st.session_state.chat_history.insert(0, {"role": "user", "content": query})
         st.rerun()
 
-    if st.session_state.embeds is None or st.session_state.embeds.size==0:
+    if st.session_state.embeds is None or st.session_state.embeds.size == 0:
         st.error("Upload a PDF first.")
         st.stop()
 
     embedder = GroqEmbedder()
-    qvec = embedder.encode(query)
-    idx, sims = cosine_topk(qvec[0], st.session_state.embeds, TOP_K_DEFAULT)
-    if len(idx)==0:
-        answer = "I don't know."
-    else:
-        context_text = "\n\n---\n\n".join([st.session_state.docs_all[i]["text"] for i in idx])
-        prompt = build_prompt(context_text, query)
-        answer, used_model = groq_generate(prompt, MAX_NEW_TOKENS_DEFAULT)
 
-    st.session_state.chat_history.insert(0,{"role":"assistant","content":answer})
-    st.session_state.chat_history.insert(0,{"role":"user","content":query})
+    # ---- SUMMARIZATION FALLBACK ----
+    if msg.startswith("summarize"):
+        # concatenate all chunks (trim if very large)
+        full_text = " ".join(d["text"] for d in st.session_state.docs_all)
+        full_text = full_text[:10000]  # avoid overload
+        prompt = f"Summarize the following document:\n\n{full_text}"
+        answer, used_model = groq_generate(prompt, MAX_NEW_TOKENS_DEFAULT * 4)
+
+    else:
+        # ---- RAG MODE / NORMAL CHAT ----
+        qvec = embedder.encode(query)
+        idx, sims = cosine_topk(qvec[0], st.session_state.embeds, TOP_K_DEFAULT)
+
+        SIM_THRESHOLD = 0.15
+        if len(idx) == 0 or max(sims) < SIM_THRESHOLD:
+            # Not enough context — just ask Groq directly
+            prompt = query
+            answer, used_model = groq_generate(prompt, MAX_NEW_TOKENS_DEFAULT)
+        else:
+            # Good context found — use it
+            context_text = "\n\n---\n\n".join([st.session_state.docs_all[i]["text"] for i in idx])
+            prompt = build_prompt(context_text, query)
+            answer, used_model = groq_generate(prompt, MAX_NEW_TOKENS_DEFAULT)
+
+    # ---- UPDATE CHAT HISTORY ----
+    st.session_state.chat_history.insert(0, {"role": "assistant", "content": answer})
+    st.session_state.chat_history.insert(0, {"role": "user", "content": query})
     st.rerun()
 
-# Chat display (newest on top)
+# =========================
+# Chat display
+# =========================
 for msg in st.session_state.chat_history:
     if msg["role"]=="user":
         st.markdown(
