@@ -101,6 +101,15 @@ class GroqEmbedder:
         self.dim = len(vecs[0])
         return np.vstack(vecs)
 
+def encode_in_batches(embedder, texts, batch_size=50):
+    """Batch encoding to avoid timeouts for large PDFs."""
+    all_vecs = []
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i:i+batch_size]
+        vecs = embedder.encode(batch)
+        all_vecs.append(vecs)
+    return np.vstack(all_vecs)
+
 def normalize_rows(M: np.ndarray) -> np.ndarray:
     if M.size == 0: return M
     n = np.linalg.norm(M, axis=1, keepdims=True) + 1e-9
@@ -129,7 +138,7 @@ def groq_generate(prompt: str, max_tokens: int):
                  "You are a helpful, friendly assistant. Use the provided context when it is relevant, otherwise answer normally."},
                 {"role": "user", "content": prompt},
             ],
-            temperature=0.3,  # slightly more creative for natural replies
+            temperature=0.3,
             max_tokens=max_tokens,
         )
         return resp.choices[0].message.content.strip(), model
@@ -139,26 +148,6 @@ def groq_generate(prompt: str, max_tokens: int):
 # =========================
 st.set_page_config(page_title="Chat with your PDFs", page_icon="🔎")
 st.title("Chat with your PDFs")
-
-st.markdown("""
-<style>
-.clear-btn {
-    background: none;
-    border: none;
-    color: inherit;
-    font-size: 14px;
-    cursor: pointer;
-}
-.icon {
-    width:20px !important;
-    height:20px !important;
-    flex-shrink:0;
-}
-.chat-row {
-    margin-bottom: 15px;
-}
-</style>
-""", unsafe_allow_html=True)
 
 if "chat_history" not in st.session_state: st.session_state.chat_history = []
 if "docs_all" not in st.session_state: st.session_state.docs_all = []
@@ -173,7 +162,7 @@ if not uploaded_files:
 else:
     current_names = {f.name for f in uploaded_files}
     st.session_state.docs_all = [d for d in st.session_state.docs_all if d["name"] in current_names]
-    embedder = GroqEmbedder()  # initialize once
+    embedder = GroqEmbedder()
     for file in uploaded_files:
         if any(doc["name"] == file.name for doc in st.session_state.docs_all):
             continue
@@ -188,7 +177,8 @@ else:
                 if c.strip(): pairs.append({"text": c, "page": i})
         texts = [p["text"] for p in pairs]
         if texts:
-            vecs = embedder.encode(texts)
+            with st.spinner(f"Indexing {file.name} ({len(texts)} chunks)…"):
+                vecs = encode_in_batches(embedder, texts, batch_size=50)
             st.session_state.docs_all.extend([{"name": file.name, "text": t} for t in texts])
             if st.session_state.embeds is None:
                 st.session_state.embeds = vecs
@@ -198,7 +188,6 @@ else:
 if st.session_state.docs_all:
     st.caption("Loaded files: " + ", ".join(sorted({d["name"] for d in st.session_state.docs_all})))
 
-# Ask form
 query = st.text_input("Ask a question", placeholder="Ask about any uploaded PDF…")
 col1, col2 = st.columns([1,5])
 ask_clicked = col1.button("Ask")
@@ -249,7 +238,8 @@ if ask_clicked and query:
         full_text = " ".join(d["text"] for d in st.session_state.docs_all)
         full_text = full_text[:10000]  # avoid overload
         prompt = f"Summarize the following document:\n\n{full_text}"
-        answer, used_model = groq_generate(prompt, MAX_NEW_TOKENS_DEFAULT * 4)
+        with st.spinner("Generating summary…"):
+            answer, used_model = groq_generate(prompt, MAX_NEW_TOKENS_DEFAULT * 4)
 
     else:
         # ---- RAG MODE / NORMAL CHAT ----
@@ -260,12 +250,14 @@ if ask_clicked and query:
         if len(idx) == 0 or max(sims) < SIM_THRESHOLD:
             # Not enough context — just ask Groq directly
             prompt = query
-            answer, used_model = groq_generate(prompt, MAX_NEW_TOKENS_DEFAULT)
+            with st.spinner("Thinking…"):
+                answer, used_model = groq_generate(prompt, MAX_NEW_TOKENS_DEFAULT)
         else:
             # Good context found — use it
             context_text = "\n\n---\n\n".join([st.session_state.docs_all[i]["text"] for i in idx])
             prompt = build_prompt(context_text, query)
-            answer, used_model = groq_generate(prompt, MAX_NEW_TOKENS_DEFAULT)
+            with st.spinner("Thinking…"):
+                answer, used_model = groq_generate(prompt, MAX_NEW_TOKENS_DEFAULT)
 
     # ---- UPDATE CHAT HISTORY ----
     st.session_state.chat_history.insert(0, {"role": "assistant", "content": answer})
