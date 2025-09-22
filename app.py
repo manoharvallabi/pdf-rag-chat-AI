@@ -78,7 +78,7 @@ def build_prompt(context: str, question: str) -> str:
     )
 
 # =========================
-# Groq clients/resources
+# Groq client
 # =========================
 @st.cache_resource
 def get_groq():
@@ -89,7 +89,7 @@ def get_groq():
 # =========================
 @st.cache_resource
 def load_local_embedder():
-    return SentenceTransformer("all-MiniLM-L6-v2")  # Fast and small
+    return SentenceTransformer("all-MiniLM-L6-v2")  # fast and free
 
 class LocalEmbedder:
     def __init__(self):
@@ -98,12 +98,10 @@ class LocalEmbedder:
     def encode(self, texts):
         if isinstance(texts, str):
             texts = [texts]
-        # normalize_embeddings=True so cosine sim works directly
         vecs = self.model.encode(texts, convert_to_numpy=True, normalize_embeddings=True)
         return vecs
 
 def encode_in_batches(embedder, texts, batch_size=50):
-    """Batch encoding to avoid timeouts for large PDFs."""
     all_vecs = []
     for i in range(0, len(texts), batch_size):
         batch = texts[i:i+batch_size]
@@ -113,8 +111,7 @@ def encode_in_batches(embedder, texts, batch_size=50):
 
 def cosine_topk(q: np.ndarray, M: np.ndarray, k: int):
     if M.size == 0 or q.size == 0: return np.array([], dtype=int), np.array([])
-    # vectors already normalized
-    sims = (M @ q.reshape(-1, 1)).ravel()
+    sims = (M @ q.reshape(-1, 1)).ravel()  # already normalized
     k = min(k, len(sims))
     idx = np.argpartition(-sims, k - 1)[:k]
     idx = idx[np.argsort(-sims[idx])]
@@ -256,7 +253,7 @@ if ask_clicked and query:
     st.rerun()
 
 # =========================
-# Chat display
+# Chat display — SVG UI (from old code)
 # =========================
 for msg in st.session_state.chat_history:
     if msg["role"]=="user":
