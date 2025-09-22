@@ -4,6 +4,7 @@ import streamlit as st
 from pypdf import PdfReader
 from pdfminer.high_level import extract_text as pdfminer_extract_text
 from groq import Groq
+from sentence_transformers import SentenceTransformer
 
 # =========================
 # Config
@@ -13,8 +14,7 @@ if not GROQ_API_KEY:
     st.error("GROQ_API_KEY not set.")
     st.stop()
 
-EMBED_MODEL = "nomic-embed-text"  # Groq embedding model
-DEFAULT_EMBED_DIM = 512
+DEFAULT_EMBED_DIM = 384  # Local model outputs 384-dim vectors
 TOP_K_DEFAULT = 3
 MAX_NEW_TOKENS_DEFAULT = 128
 GROQ_MODELS = ["llama-3.1-8b-instant"]
@@ -85,21 +85,22 @@ def get_groq():
     return Groq(api_key=GROQ_API_KEY)
 
 # =========================
-# Embeddings (Groq)
+# Local Embeddings (SentenceTransformer)
 # =========================
-class GroqEmbedder:
-    def __init__(self, model=EMBED_MODEL):
-        self.model = model
-        self.client = get_groq()
-        self.dim = DEFAULT_EMBED_DIM
+@st.cache_resource
+def load_local_embedder():
+    return SentenceTransformer("all-MiniLM-L6-v2")  # Fast and small
+
+class LocalEmbedder:
+    def __init__(self):
+        self.model = load_local_embedder()
 
     def encode(self, texts):
         if isinstance(texts, str):
             texts = [texts]
-        resp = self.client.embeddings.create(model=self.model, input=texts)
-        vecs = [np.array(d.embedding, dtype=np.float32) for d in resp.data]
-        self.dim = len(vecs[0])
-        return np.vstack(vecs)
+        # normalize_embeddings=True so cosine sim works directly
+        vecs = self.model.encode(texts, convert_to_numpy=True, normalize_embeddings=True)
+        return vecs
 
 def encode_in_batches(embedder, texts, batch_size=50):
     """Batch encoding to avoid timeouts for large PDFs."""
@@ -110,16 +111,10 @@ def encode_in_batches(embedder, texts, batch_size=50):
         all_vecs.append(vecs)
     return np.vstack(all_vecs)
 
-def normalize_rows(M: np.ndarray) -> np.ndarray:
-    if M.size == 0: return M
-    n = np.linalg.norm(M, axis=1, keepdims=True) + 1e-9
-    return M / n
-
 def cosine_topk(q: np.ndarray, M: np.ndarray, k: int):
     if M.size == 0 or q.size == 0: return np.array([], dtype=int), np.array([])
-    qn = q / (np.linalg.norm(q) + 1e-9)
-    Mn = normalize_rows(M)
-    sims = (Mn @ qn.reshape(-1, 1)).ravel()
+    # vectors already normalized
+    sims = (M @ q.reshape(-1, 1)).ravel()
     k = min(k, len(sims))
     idx = np.argpartition(-sims, k - 1)[:k]
     idx = idx[np.argsort(-sims[idx])]
@@ -162,7 +157,7 @@ if not uploaded_files:
 else:
     current_names = {f.name for f in uploaded_files}
     st.session_state.docs_all = [d for d in st.session_state.docs_all if d["name"] in current_names]
-    embedder = GroqEmbedder()
+    embedder = LocalEmbedder()
     for file in uploaded_files:
         if any(doc["name"] == file.name for doc in st.session_state.docs_all):
             continue
@@ -230,11 +225,10 @@ if ask_clicked and query:
         st.error("Upload a PDF first.")
         st.stop()
 
-    embedder = GroqEmbedder()
+    embedder = LocalEmbedder()
 
     # ---- SUMMARIZATION FALLBACK ----
     if msg.startswith("summarize"):
-        # concatenate all chunks (trim if very large)
         full_text = " ".join(d["text"] for d in st.session_state.docs_all)
         full_text = full_text[:10000]  # avoid overload
         prompt = f"Summarize the following document:\n\n{full_text}"
@@ -248,18 +242,15 @@ if ask_clicked and query:
 
         SIM_THRESHOLD = 0.15
         if len(idx) == 0 or max(sims) < SIM_THRESHOLD:
-            # Not enough context — just ask Groq directly
             prompt = query
             with st.spinner("Thinking…"):
                 answer, used_model = groq_generate(prompt, MAX_NEW_TOKENS_DEFAULT)
         else:
-            # Good context found — use it
             context_text = "\n\n---\n\n".join([st.session_state.docs_all[i]["text"] for i in idx])
             prompt = build_prompt(context_text, query)
             with st.spinner("Thinking…"):
                 answer, used_model = groq_generate(prompt, MAX_NEW_TOKENS_DEFAULT)
 
-    # ---- UPDATE CHAT HISTORY ----
     st.session_state.chat_history.insert(0, {"role": "assistant", "content": answer})
     st.session_state.chat_history.insert(0, {"role": "user", "content": query})
     st.rerun()
