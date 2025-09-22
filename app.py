@@ -253,7 +253,7 @@ if ask_clicked and query:
     st.rerun()
 
 # =========================
-# Chat display — consistent SVG UI (fixed 32x32 icons)
+# Chat display — fixed 32×32 icons and alignment
 # =========================
 svg_user = """
 <svg style='width:32px;height:32px;' xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20'>
@@ -270,11 +270,13 @@ svg_bot = """
 """
 
 for msg in st.session_state.chat_history:
-    if msg["role"] == "user":
-        st.markdown(
-            f"<div style='display:flex;align-items:center;margin-bottom:8px;'>{svg_user}<span style='margin-left:8px;'>{msg['content']}</span></div>",
-            unsafe_allow_html=True)
-    else:
-        st.markdown(
-            f"<div style='display:flex;align-items:center;margin-bottom:8px;'>{svg_bot}<span style='margin-left:8px;'>{msg['content']}</span></div>",
-            unsafe_allow_html=True)
+    icon = svg_user if msg["role"] == "user" else svg_bot
+    st.markdown(
+        f"""
+        <div style='display:flex;align-items:flex-start;margin-bottom:12px;'>
+          <div style='width:32px;height:32px;flex:0 0 32px;'>{icon}</div>
+          <div style='margin-left:8px;flex:1;'>{msg['content']}</div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
