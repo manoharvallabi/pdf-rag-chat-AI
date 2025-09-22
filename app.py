@@ -256,8 +256,6 @@ if ask_clicked and query:
 # Chat display — consistent SVG UI (fixed 32x32 icons)
 # =========================
 
-st.markdown("<svg width='32' height='32' viewBox='0 0 20 20'><circle cx='10' cy='10' r='10' fill='red'/></svg>", unsafe_allow_html=True)
-
 svg_user = """
 <svg width='32' height='32' xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20'>
 <g fill='none' stroke='currentColor' stroke-linecap='round'>
