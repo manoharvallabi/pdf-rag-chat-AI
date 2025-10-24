@@ -14,28 +14,29 @@ if not GROQ_API_KEY:
     st.error("GROQ_API_KEY not set.")
     st.stop()
 
-DEFAULT_EMBED_DIM = 384  # Local model outputs 384-dim vectors
+DEFAULT_EMBED_DIM = 384
 TOP_K_DEFAULT = 3
 MAX_NEW_TOKENS_DEFAULT = 128
-GROQ_MODELS = ["llama-3.1-8b-instant"]
+GROQ_MODEL = "llama-3.1-8b-instant"
+SIM_THRESHOLD = 0.15
 
 # =========================
-# Text utils
+# Text utilities
 # =========================
 def clean_text(s: str) -> str:
-    if not s: return ""
+    if not s:
+        return ""
     s = re.sub(r"(\w)-\n(\w)", r"\1\2", s)
     s = re.sub(r"[ \t]*\n[ \t]*", " ", s)
     s = re.sub(r"[ \t]{2,}", " ", s)
     return s.strip()
 
-def split_paragraphs(text: str) -> list[str]:
+def split_paragraphs(text: str):
     paras = [clean_text(p) for p in re.split(r"\n\s*\n", text)]
     return [p for p in paras if p]
 
-def merge_to_chunks(paras: list[str], target: int = 900, overlap: int = 120) -> list[str]:
-    chunks, buf = [], []
-    cur = 0
+def merge_to_chunks(paras, target=900, overlap=120):
+    chunks, buf, cur = [], [], 0
     for p in paras:
         if cur + len(p) + 1 <= target or not buf:
             buf.append(p); cur += len(p) + 1
@@ -45,215 +46,181 @@ def merge_to_chunks(paras: list[str], target: int = 900, overlap: int = 120) -> 
             for para in reversed(buf):
                 carry.insert(0, para); acc += len(para) + 1
                 if acc >= overlap: break
-            buf = carry + [p]
-            cur = sum(len(x) + 1 for x in buf)
-    if buf: chunks.append(" ".join(buf))
+            buf = carry + [p]; cur = sum(len(x) + 1 for x in buf)
+    if buf:
+        chunks.append(" ".join(buf))
     return chunks
 
-def pdf_to_pages(data: bytes) -> list[str]:
+def pdf_to_pages(data: bytes):
     pages = []
     try:
         reader = PdfReader(io.BytesIO(data))
         for p in reader.pages:
-            try: t = p.extract_text() or ""
-            except: t = ""
+            try:
+                t = p.extract_text() or ""
+            except Exception:
+                t = ""
             pages.append(clean_text(t))
     except Exception:
         pages = []
+
     if sum(len(p or "") for p in pages) >= 500:
         return pages
+
     try:
         text_all = pdfminer_extract_text(io.BytesIO(data)) or ""
         pages_pm = [clean_text(x) for x in text_all.split("\f")]
         if sum(len(p or "") for p in pages_pm) > sum(len(p or "") for p in pages):
             return pages_pm
-    except: pass
+    except Exception:
+        pass
+
     return pages
 
-def build_prompt(context: str, question: str) -> str:
+def build_prompt(context, question):
     return (
         "Use the provided context to answer as much as possible. "
-        "If the question is not answered by the context, respond naturally as a helpful assistant. "
+        "If the question is not answered by the context, respond naturally as a helpful assistant.\n\n"
         f"Context:\n{context}\n\nQuestion: {question}\nAnswer:"
     )
 
 # =========================
-# Groq client
+# Groq & Embeddings
 # =========================
 @st.cache_resource
 def get_groq():
     return Groq(api_key=GROQ_API_KEY)
 
-# =========================
-# Local Embeddings (SentenceTransformer)
-# =========================
 @st.cache_resource
-def load_local_embedder():
-    return SentenceTransformer("all-MiniLM-L6-v2")  # fast and free
+def get_embedder():
+    return SentenceTransformer("all-MiniLM-L6-v2")
 
-class LocalEmbedder:
-    def __init__(self):
-        self.model = load_local_embedder()
+def embed_texts(embedder, texts):
+    if isinstance(texts, str):
+        texts = [texts]
+    return embedder.encode(texts, convert_to_numpy=True, normalize_embeddings=True)
 
-    def encode(self, texts):
-        if isinstance(texts, str):
-            texts = [texts]
-        vecs = self.model.encode(texts, convert_to_numpy=True, normalize_embeddings=True)
-        return vecs
-
-def encode_in_batches(embedder, texts, batch_size=50):
-    all_vecs = []
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i:i+batch_size]
-        vecs = embedder.encode(batch)
-        all_vecs.append(vecs)
-    return np.vstack(all_vecs)
-
-def cosine_topk(q: np.ndarray, M: np.ndarray, k: int):
-    if M.size == 0 or q.size == 0: return np.array([], dtype=int), np.array([])
-    sims = (M @ q.reshape(-1, 1)).ravel()  # already normalized
-    k = min(k, len(sims))
-    idx = np.argpartition(-sims, k - 1)[:k]
-    idx = idx[np.argsort(-sims[idx])]
+def cosine_topk(q, M, k):
+    if M.size == 0:
+        return np.array([], dtype=int), np.array([])
+    sims = (M @ q.reshape(-1, 1)).ravel()
+    idx = np.argsort(-sims)[:k]
     return idx, sims[idx]
 
-# =========================
-# Groq generation
-# =========================
-def groq_generate(prompt: str, max_tokens: int):
+def groq_generate(prompt, max_tokens=MAX_NEW_TOKENS_DEFAULT):
     client = get_groq()
-    for model in GROQ_MODELS:
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content":
-                 "You are a helpful, friendly assistant. Use the provided context when it is relevant, otherwise answer normally."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.3,
-            max_tokens=max_tokens,
-        )
-        return resp.choices[0].message.content.strip(), model
+    resp = client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=[
+            {"role": "system", "content": "Be concise and helpful. Use context when given."},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.3,
+        max_tokens=max_tokens,
+    )
+    return resp.choices[0].message.content.strip()
 
 # =========================
-# App UI
+# Streamlit App
 # =========================
-st.set_page_config(page_title="Chat with your PDFs", page_icon="🔎")
-st.title("Chat with your PDFs")
+st.set_page_config(page_title="Chat with PDFs", page_icon="📘")
+st.title("📘 Chat with Your PDFs")
 
-if "chat_history" not in st.session_state: st.session_state.chat_history = []
-if "docs_all" not in st.session_state: st.session_state.docs_all = []
-if "embeds" not in st.session_state: st.session_state.embeds = None
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+if "docs_all" not in st.session_state:
+    st.session_state.docs_all = []
+if "embeds" not in st.session_state:
+    st.session_state.embeds = None
 
 uploaded_files = st.file_uploader("Upload one or more PDFs", type=["pdf"], accept_multiple_files=True)
 
-# Sync docs with uploader
-if not uploaded_files:
-    st.session_state.docs_all = []
-    st.session_state.embeds = None
-else:
+if uploaded_files:
+    embedder = get_embedder()
     current_names = {f.name for f in uploaded_files}
     st.session_state.docs_all = [d for d in st.session_state.docs_all if d["name"] in current_names]
-    embedder = LocalEmbedder()
+
     for file in uploaded_files:
         if any(doc["name"] == file.name for doc in st.session_state.docs_all):
             continue
+
         data = file.read()
         pages = pdf_to_pages(data)
         pairs = []
         for i, page_text in enumerate(pages, start=1):
-            if not page_text: continue
+            if not page_text:
+                continue
             paras = split_paragraphs(page_text)
             chunks = merge_to_chunks(paras)
             for c in chunks:
-                if c.strip(): pairs.append({"text": c, "page": i})
+                if c.strip():
+                    pairs.append({"text": c, "page": i})
+
         texts = [p["text"] for p in pairs]
         if texts:
-            with st.spinner(f"Indexing {file.name} ({len(texts)} chunks)…"):
-                vecs = encode_in_batches(embedder, texts, batch_size=50)
+            with st.spinner(f"Indexing {file.name}..."):
+                vecs = embed_texts(embedder, texts)
             st.session_state.docs_all.extend([{"name": file.name, "text": t} for t in texts])
-            if st.session_state.embeds is None:
-                st.session_state.embeds = vecs
-            else:
-                st.session_state.embeds = np.vstack([st.session_state.embeds, vecs])
-
-if st.session_state.docs_all:
+            st.session_state.embeds = (
+                vecs if st.session_state.embeds is None
+                else np.vstack([st.session_state.embeds, vecs])
+            )
     st.caption("Loaded files: " + ", ".join(sorted({d["name"] for d in st.session_state.docs_all})))
 
+# =========================
+# Query & Chat
+# =========================
 query = st.text_input("Ask a question", placeholder="Ask about any uploaded PDF…")
-col1, col2 = st.columns([1,5])
+
+col1, col2 = st.columns([1, 5])
 ask_clicked = col1.button("Ask")
-if len(st.session_state.chat_history) > 0:
-    clear_clicked = col2.button("Clear chat", help="Clear chat", key="clear_chat", use_container_width=False)
-else:
-    clear_clicked = False
+clear_clicked = col2.button("Clear chat") if len(st.session_state.chat_history) > 0 else False
 
 if clear_clicked:
     st.session_state.chat_history = []
     st.rerun()
 
-# =========================
-# Question handling
-# =========================
 if ask_clicked and query:
     msg = query.strip().lower()
+    embedder = get_embedder()
 
-    # quick responses
+    # Smart greetings & info
     if msg == "hi":
         answer = "Hi, happy to help — start your questions!"
-        st.session_state.chat_history.insert(0, {"role": "assistant", "content": answer})
-        st.session_state.chat_history.insert(0, {"role": "user", "content": query})
-        st.rerun()
-
-    if "your name" in msg:
-        answer = "I'm a chatbot powered by Groq."
-        st.session_state.chat_history.insert(0, {"role": "assistant", "content": answer})
-        st.session_state.chat_history.insert(0, {"role": "user", "content": query})
-        st.rerun()
-
-    if "how many" in msg and ("document" in msg or "pdf" in msg):
+    elif "hi" in msg and len(msg.split()) <= 3:
+        answer = "Please continue with your question."
+    elif "your name" in msg:
+        answer = "I'm your document assistant, powered by Groq."
+    elif "how many" in msg and ("document" in msg or "pdf" in msg):
         count = len({d["name"] for d in st.session_state.docs_all})
         answer = f"You currently have {count} PDF document{'s' if count != 1 else ''} uploaded."
-        st.session_state.chat_history.insert(0, {"role": "assistant", "content": answer})
-        st.session_state.chat_history.insert(0, {"role": "user", "content": query})
-        st.rerun()
-
-    if st.session_state.embeds is None or st.session_state.embeds.size == 0:
-        st.error("Upload a PDF first.")
-        st.stop()
-
-    embedder = LocalEmbedder()
-
-    # ---- SUMMARIZATION FALLBACK ----
-    if msg.startswith("summarize"):
-        full_text = " ".join(d["text"] for d in st.session_state.docs_all)
-        full_text = full_text[:10000]  # avoid overload
-        prompt = f"Summarize the following document:\n\n{full_text}"
-        with st.spinner("Generating summary…"):
-            answer, used_model = groq_generate(prompt, MAX_NEW_TOKENS_DEFAULT * 4)
-
+    elif msg.startswith("summarize"):
+        text_all = " ".join(d["text"] for d in st.session_state.docs_all)
+        prompt = f"Summarize this document:\n\n{text_all[:12000]}"
+        with st.spinner("Summarizing..."):
+            answer = groq_generate(prompt, MAX_NEW_TOKENS_DEFAULT * 3)
     else:
-        # ---- RAG MODE / NORMAL CHAT ----
-        qvec = embedder.encode(query)
-        idx, sims = cosine_topk(qvec[0], st.session_state.embeds, TOP_K_DEFAULT)
-
-        SIM_THRESHOLD = 0.15
-        if len(idx) == 0 or max(sims) < SIM_THRESHOLD:
-            prompt = query
-            with st.spinner("Thinking…"):
-                answer, used_model = groq_generate(prompt, MAX_NEW_TOKENS_DEFAULT)
+        if st.session_state.embeds is None or st.session_state.embeds.size == 0:
+            answer = "Please upload a PDF first."
         else:
-            context_text = "\n\n---\n\n".join([st.session_state.docs_all[i]["text"] for i in idx])
-            prompt = build_prompt(context_text, query)
-            with st.spinner("Thinking…"):
-                answer, used_model = groq_generate(prompt, MAX_NEW_TOKENS_DEFAULT)
+            qvec = embed_texts(embedder, query)[0]
+            idx, sims = cosine_topk(qvec, st.session_state.embeds, TOP_K_DEFAULT)
+            if len(idx) == 0 or max(sims) < SIM_THRESHOLD:
+                prompt = query
+            else:
+                context_text = "\n\n---\n\n".join(
+                    [st.session_state.docs_all[i]["text"] for i in idx]
+                )
+                prompt = build_prompt(context_text, query)
+            with st.spinner("Thinking..."):
+                answer = groq_generate(prompt, MAX_NEW_TOKENS_DEFAULT)
 
     st.session_state.chat_history.insert(0, {"role": "assistant", "content": answer})
     st.session_state.chat_history.insert(0, {"role": "user", "content": query})
     st.rerun()
 
 # =========================
-# Chat display — fixed 32×32 icons and alignment
+# Chat Display (UI preserved)
 # =========================
 svg_user = """
 <svg style='width:32px;height:32px;' xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20'>
